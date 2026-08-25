@@ -40,7 +40,7 @@ func (s *MongoStoreSuite) TestNew() {
 		s.Error(err, "New must ping, not wait for the first silent write to fail")
 	})
 
-	s.Run("creates the three index shapes plus the graph index", func() {
+	s.Run("creates the index shapes the pattern lookups need", func() {
 		st := s.newStore(s.T())
 		st.Add(triple(uri("a"), uri("p"), uri("b")), nil)
 
@@ -60,10 +60,12 @@ func (s *MongoStoreSuite) TestNew() {
 			got[idx.Name] = idx.Unique
 		}
 
-		for _, name := range []string{"spog", "posg", "ospg", "g"} {
+		for _, name := range []string{"spg", "pog", "og", "g"} {
 			s.Contains(got, name, "index %s is missing", name)
 		}
-		s.True(got["spog"], "spog must be unique — Add relies on it for idempotence")
+		s.True(got["spg"],
+			"spg must be unique — it is what identifies one document, and what makes "+
+				"Add an upsert and Set a single-document update")
 	})
 
 	s.Run("is idempotent over an existing database", func() {
@@ -75,10 +77,10 @@ func (s *MongoStoreSuite) TestNew() {
 		s.Equal(1, second.Len(nil), "a second New over the same database must see the data")
 	})
 
-	s.Run("reports a replica set as transactional", func() {
+	s.Run("reports a standalone server as non-transactional", func() {
 		st := s.newStore(s.T())
-		s.True(st.TransactionAware(),
-			"the suite runs a single-node replica set, so transactions must be available")
+		s.False(st.TransactionAware(),
+			"the suite runs a standalone mongod; claiming transactions would be a lie")
 		s.True(st.ContextAware())
 	})
 }
@@ -387,28 +389,49 @@ func (s *MongoStoreSuite) TestGraphAndSPARQLOverMongo() {
 // TestDocumentLayout pins the on-disk shape. It is a public contract: the
 // README documents these field names, and anyone querying the collection from
 // mongosh or an aggregation depends on them.
+//
+// The layout is not one document per triple. Every object of a given subject
+// and predicate in a given graph lives in one document, because that is what
+// makes Set atomic without a transaction — see TestSetIsASingleDocumentUpdate.
 func (s *MongoStoreSuite) TestDocumentLayout() {
 	st := s.newStore(s.T())
 	st.Add(triple(uri("Alice"), uri("knows"), uri("Bob")), nil)
-	st.Add(triple(uri("Alice"), uri("knows"), uri("Carol")), uri("graph1"))
+	st.Add(triple(uri("Alice"), uri("knows"), uri("Carol")), nil)
+	st.Add(triple(uri("Alice"), uri("name"), term.NewLiteral("Alice")), nil)
+	st.Add(triple(uri("Alice"), uri("knows"), uri("Dave")), uri("graph1"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
 
+	type doc struct {
+		S string   `bson:"s"`
+		P string   `bson:"p"`
+		O []string `bson:"o"`
+		G string   `bson:"g"`
+	}
+
 	s.Run("terms are stored as TermKey strings", func() {
-		var doc struct {
-			S string `bson:"s"`
-			P string `bson:"p"`
-			O string `bson:"o"`
-			G string `bson:"g"`
-		}
-		err := st.Collection().FindOne(ctx, bson.D{{Key: "o", Value: term.TermKey(uri("Bob"))}}).Decode(&doc)
+		var d doc
+		err := st.Collection().FindOne(ctx, bson.D{
+			{Key: "s", Value: term.TermKey(uri("Alice"))},
+			{Key: "p", Value: term.TermKey(uri("knows"))},
+			{Key: "g", Value: ""},
+		}).Decode(&d)
 		s.Require().NoError(err)
 
-		s.Equal("U:http://example.org/Alice", doc.S)
-		s.Equal("U:http://example.org/knows", doc.P)
-		s.Equal("U:http://example.org/Bob", doc.O)
-		s.Equal("", doc.G, "the default graph is the empty string")
+		s.Equal("U:http://example.org/Alice", d.S)
+		s.Equal("U:http://example.org/knows", d.P)
+		s.ElementsMatch([]string{"U:http://example.org/Bob", "U:http://example.org/Carol"}, d.O)
+		s.Equal("", d.G, "the default graph is the empty string")
+	})
+
+	s.Run("one document per subject, predicate and graph", func() {
+		n, err := st.Collection().CountDocuments(ctx, bson.D{})
+		s.Require().NoError(err)
+		s.Equal(int64(3), n,
+			"four triples over three (s,p,g) combinations must be three documents")
+		s.Equal(3, st.Len(nil), "three triples in the default graph")
+		s.Equal(1, st.Len(uri("graph1")))
 	})
 
 	s.Run("a named graph is stored under its own key", func() {
@@ -419,10 +442,68 @@ func (s *MongoStoreSuite) TestDocumentLayout() {
 	})
 
 	s.Run("a blank node context is folded into the default graph", func() {
-		st.Add(triple(uri("Dave"), uri("knows"), uri("Erin")), term.NewBNode())
-		n, err := st.Collection().CountDocuments(ctx, bson.D{{Key: "g", Value: ""}})
+		st.Add(triple(uri("Erin"), uri("knows"), uri("Frank")), term.NewBNode())
+		s.Equal(4, st.Len(nil), "a blank node cannot name a graph")
+	})
+
+	s.Run("removing the last object removes the document", func() {
+		st.Remove(term.TriplePattern{
+			Subject: uri("Erin"), Predicate: predPtr(uri("knows")), Object: uri("Frank"),
+		}, nil)
+
+		n, err := st.Collection().CountDocuments(ctx,
+			bson.D{{Key: "s", Value: term.TermKey(uri("Erin"))}})
 		s.Require().NoError(err)
-		s.Equal(int64(2), n, "a blank node cannot name a graph")
+		s.Zero(n, "an empty document would keep its graph alive in Contexts")
+	})
+}
+
+// TestSetIsASingleDocumentUpdate is the test the storage layout exists for.
+//
+// store.Store requires that Set replace (s, p, *) without a concurrent reader
+// ever seeing the interval where the old value is gone and the new one is not
+// yet there. On a standalone mongod there are no transactions, so the only
+// atomicity available is per document — which is why every object of a subject
+// and predicate lives in one document.
+func (s *MongoStoreSuite) TestSetIsASingleDocumentUpdate() {
+	st := s.newStore(s.T())
+
+	s.Run("Set collapses many values into one", func() {
+		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(29)), nil)
+		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(30)), nil)
+		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(31)), nil)
+		s.Equal(3, st.Len(nil))
+
+		st.Set(triple(uri("Alice"), uri("age"), term.NewLiteral(32)), nil)
+		s.Equal(1, st.Len(nil))
+	})
+
+	s.Run("a concurrent reader never sees zero values", func() {
+		st.Set(triple(uri("Bob"), uri("age"), term.NewLiteral(1)), nil)
+
+		pattern := term.TriplePattern{Subject: uri("Bob"), Predicate: predPtr(uri("age"))}
+		done := make(chan struct{})
+		var missing int
+
+		go func() {
+			defer close(done)
+			for i := 2; i < 60; i++ {
+				st.Set(triple(uri("Bob"), uri("age"), term.NewLiteral(i)), nil)
+			}
+		}()
+
+		for {
+			select {
+			case <-done:
+				s.Zero(missing,
+					"a reader saw the value missing %d times; Set is not atomic", missing)
+				return
+			default:
+				if countTriples(st.Triples(pattern, nil)) == 0 {
+					missing++
+				}
+			}
+		}
 	})
 }
 

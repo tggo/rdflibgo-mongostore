@@ -12,21 +12,12 @@ import (
 	"github.com/tggo/goRDFlib/term"
 )
 
-// tripleProjection keeps the decoded documents to the three fields that matter.
-// The stored _id and g are never needed by a caller of Triples.
-var tripleProjection = bson.D{
-	{Key: "_id", Value: 0},
-	{Key: "s", Value: 1},
-	{Key: "p", Value: 1},
-	{Key: "o", Value: 1},
-}
-
 // patternFilter builds the query document for a triple pattern in a context.
 //
-// The graph key is always present, which is what keeps every read and delete
-// scoped to one graph. The bound positions are appended in s, p, o order so the
-// filter lines up with a prefix of the spog index whenever the subject is
-// bound; the planner picks posg or ospg for the other shapes.
+// The graph key is always present, which keeps every read and delete scoped to
+// one graph. A bound object matches against the object array by containment,
+// which is ordinary MongoDB array semantics and is served by the multikey pog
+// and og indexes.
 func patternFilter(pattern term.TriplePattern, ctx term.Term) bson.D {
 	filter := bson.D{{Key: "g", Value: graphKey(ctx)}}
 	if pattern.Subject != nil {
@@ -41,42 +32,35 @@ func patternFilter(pattern term.TriplePattern, ctx term.Term) bson.D {
 	return filter
 }
 
-// tripleRow is the decoded form of a stored document.
+// tripleRow is the decoded form of a stored document: one subject and
+// predicate, and every object they point at in this graph.
 type tripleRow struct {
-	S string `bson:"s"`
-	P string `bson:"p"`
-	O string `bson:"o"`
+	S string   `bson:"s"`
+	P string   `bson:"p"`
+	O []string `bson:"o"`
 }
 
-// decode rebuilds a Triple from the stored keys.
-//
-// A row that cannot be decoded is a real problem — it means something wrote a
-// key this build cannot read — so the caller reports it through the error
-// handler rather than skipping it silently.
-func (r tripleRow) decode() (term.Triple, error) {
+// subjectPredicate decodes the two scalar fields shared by every triple in the
+// document.
+func (r tripleRow) subjectPredicate() (term.Subject, term.URIRef, error) {
 	s, err := term.TermFromKey(r.S)
 	if err != nil {
-		return term.Triple{}, err
+		return nil, term.URIRef{}, err
 	}
 	subj, ok := s.(term.Subject)
 	if !ok {
-		return term.Triple{}, &decodeError{field: "s", key: r.S, reason: "not a subject term"}
+		return nil, term.URIRef{}, &decodeError{field: "s", key: r.S, reason: "not a subject term"}
 	}
 
 	p, err := term.TermFromKey(r.P)
 	if err != nil {
-		return term.Triple{}, err
+		return nil, term.URIRef{}, err
 	}
 	pred, ok := p.(term.URIRef)
 	if !ok {
-		return term.Triple{}, &decodeError{field: "p", key: r.P, reason: "not a URIRef"}
+		return nil, term.URIRef{}, &decodeError{field: "p", key: r.P, reason: "not a URIRef"}
 	}
-
-	o, err := term.TermFromKey(r.O)
-	if err != nil {
-		return term.Triple{}, err
-	}
-	return term.Triple{Subject: subj, Predicate: pred, Object: o}, nil
+	return subj, pred, nil
 }
 
 type decodeError struct {
@@ -95,37 +79,31 @@ func (e *decodeError) Error() string {
 // closed when it ends — including when the consumer stops early by returning
 // false.
 func (s *MongoStore) Triples(pattern term.TriplePattern, ctx term.Term) store.TripleIterator {
-	return s.find("Triples", patternFilter(pattern, ctx))
-}
+	filter := patternFilter(pattern, ctx)
 
-// TriplesWithLimit applies LIMIT and OFFSET in the server.
-//
-// A limit of zero or less means "no limit", matching the other backends, and a
-// negative offset is treated as zero. Store promises no iteration order, and
-// this backend does not impose one either, so paging across separate calls is
-// only meaningful together with a caller-side sort.
-func (s *MongoStore) TriplesWithLimit(pattern term.TriplePattern, ctx term.Term, limit, offset int) store.TripleIterator {
-	opts := options.Find().SetProjection(tripleProjection)
-	if limit > 0 {
-		opts = opts.SetLimit(int64(limit))
+	// With the object bound, only the matching element of the array is worth
+	// transferring. A subject with a wide predicate would otherwise ship its
+	// whole object list to answer a single-triple lookup.
+	projection := bson.D{
+		{Key: "_id", Value: 0},
+		{Key: "s", Value: 1},
+		{Key: "p", Value: 1},
+		{Key: "o", Value: 1},
 	}
-	if offset > 0 {
-		opts = opts.SetSkip(int64(offset))
+	if pattern.Object != nil {
+		projection[3] = bson.E{Key: "o", Value: bson.D{{Key: "$elemMatch", Value: bson.D{
+			{Key: "$eq", Value: term.TermKey(pattern.Object)},
+		}}}}
 	}
-	return s.find("TriplesWithLimit", patternFilter(pattern, ctx), opts)
-}
+	opts := options.Find().SetProjection(projection)
 
-func (s *MongoStore) find(op string, filter bson.D, opts ...options.Lister[options.FindOptions]) store.TripleIterator {
 	return func(yield func(term.Triple) bool) {
 		c, cancel := s.opCtx()
 		defer cancel()
 
-		if len(opts) == 0 {
-			opts = []options.Lister[options.FindOptions]{options.Find().SetProjection(tripleProjection)}
-		}
-		cur, err := s.tripl.Find(c, filter, opts...)
+		cur, err := s.tripl.Find(c, filter, opts)
 		if err != nil {
-			s.fail(op, err)
+			s.fail("Triples", err)
 			return
 		}
 		defer cur.Close(c)
@@ -133,19 +111,102 @@ func (s *MongoStore) find(op string, filter bson.D, opts ...options.Lister[optio
 		for cur.Next(c) {
 			var row tripleRow
 			if err := cur.Decode(&row); err != nil {
-				s.fail(op, err)
+				s.fail("Triples", err)
 				continue
 			}
-			t, err := row.decode()
+			subj, pred, err := row.subjectPredicate()
 			if err != nil {
-				s.fail(op, err)
+				s.fail("Triples", err)
 				continue
 			}
-			if !yield(t) {
+			for _, objKey := range row.O {
+				obj, err := term.TermFromKey(objKey)
+				if err != nil {
+					s.fail("Triples", err)
+					continue
+				}
+				if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}) {
+					return
+				}
+			}
+		}
+		s.fail("Triples", cur.Err())
+	}
+}
+
+// unwindPipeline turns matching documents back into one entry per triple.
+// Anything that counts or pages over triples rather than over documents needs
+// it, because a document holds a whole object list.
+func unwindPipeline(pattern term.TriplePattern, ctx term.Term) mongo.Pipeline {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: patternFilter(pattern, ctx)}},
+		bson.D{{Key: "$unwind", Value: "$o"}},
+	}
+	// $unwind emits every object of each matching document, including the ones
+	// the bound-object filter was never meant to select, so the filter has to
+	// be applied again after it.
+	if pattern.Object != nil {
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.D{
+			{Key: "o", Value: term.TermKey(pattern.Object)},
+		}}})
+	}
+	return pipeline
+}
+
+// TriplesWithLimit applies LIMIT and OFFSET in the server, over triples rather
+// than over stored documents.
+//
+// A limit of zero or less means "no limit", matching the other backends, and a
+// negative offset is treated as zero. Store promises no iteration order, and
+// this backend does not impose one either, so paging across separate calls is
+// only meaningful together with a caller-side sort.
+func (s *MongoStore) TriplesWithLimit(pattern term.TriplePattern, ctx term.Term, limit, offset int) store.TripleIterator {
+	pipeline := unwindPipeline(pattern, ctx)
+	if offset > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$skip", Value: int64(offset)}})
+	}
+	if limit > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$limit", Value: int64(limit)}})
+	}
+
+	return func(yield func(term.Triple) bool) {
+		c, cancel := s.opCtx()
+		defer cancel()
+
+		cur, err := s.tripl.Aggregate(c, pipeline)
+		if err != nil {
+			s.fail("TriplesWithLimit", err)
+			return
+		}
+		defer cur.Close(c)
+
+		for cur.Next(c) {
+			// After $unwind the object is a scalar again, so this decodes into
+			// a single-triple shape rather than tripleRow.
+			var row struct {
+				S string `bson:"s"`
+				P string `bson:"p"`
+				O string `bson:"o"`
+			}
+			if err := cur.Decode(&row); err != nil {
+				s.fail("TriplesWithLimit", err)
+				continue
+			}
+			subj, pred, err := tripleRow{S: row.S, P: row.P}.subjectPredicate()
+			if err != nil {
+				s.fail("TriplesWithLimit", err)
+				continue
+			}
+			obj, err := term.TermFromKey(row.O)
+			if err != nil {
+				s.fail("TriplesWithLimit", err)
+				continue
+			}
+			if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}) {
 				return
 			}
 		}
-		s.fail(op, cur.Err())
+		s.fail("TriplesWithLimit", cur.Err())
 	}
 }
 
@@ -157,16 +218,52 @@ func (s *MongoStore) Len(ctx term.Term) int {
 
 // Count returns the number of triples matching the pattern without
 // materializing them.
+//
+// A bound object means at most one triple per document, so counting documents
+// answers it directly. Otherwise the object lists have to be summed, which is
+// what the aggregation does.
 func (s *MongoStore) Count(pattern term.TriplePattern, ctx term.Term) int {
 	c, cancel := s.opCtx()
 	defer cancel()
 
-	n, err := s.tripl.CountDocuments(c, patternFilter(pattern, ctx))
+	if pattern.Object != nil {
+		n, err := s.tripl.CountDocuments(c, patternFilter(pattern, ctx))
+		if err != nil {
+			s.fail("Count", err)
+			return 0
+		}
+		return int(n)
+	}
+
+	cur, err := s.tripl.Aggregate(c, mongo.Pipeline{
+		bson.D{{Key: "$match", Value: patternFilter(pattern, ctx)}},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "n", Value: bson.D{{Key: "$sum", Value: bson.D{{Key: "$size", Value: "$o"}}}}},
+		}}},
+	})
 	if err != nil {
 		s.fail("Count", err)
 		return 0
 	}
-	return int(n)
+	defer cur.Close(c)
+
+	total := 0
+	for cur.Next(c) {
+		var row struct {
+			N int `bson:"n"`
+		}
+		if err := cur.Decode(&row); err != nil {
+			s.fail("Count", err)
+			return 0
+		}
+		total += row.N
+	}
+	if err := cur.Err(); err != nil {
+		s.fail("Count", err)
+		return 0
+	}
+	return total
 }
 
 // Exists reports whether at least one triple matches the pattern. It asks the

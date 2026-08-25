@@ -25,7 +25,6 @@ import (
 const (
 	mongoImage    = "mongo"
 	mongoTag      = "8"
-	replicaSet    = "rs0"
 	startTimeout  = 90 * time.Second
 	containerTTL  = 600 // seconds; a safety net if the suite is killed
 	opTimeout     = 20 * time.Second
@@ -35,9 +34,12 @@ const (
 
 // MongoStoreSuite runs every test in this package against a real mongod.
 //
-// The server is a single-node replica set rather than a standalone, because a
-// standalone cannot run transactions and Set's atomicity guarantee would go
-// untested — which is exactly the guarantee most likely to be quietly wrong.
+// The server is a plain standalone, deliberately: that is what the deployments
+// this backend targets actually run, and a standalone cannot execute
+// transactions. Testing against a replica set would let a design that quietly
+// depends on transactions pass here and lose data in production. Everything in
+// this package is built to be atomic without them, and this is where that is
+// checked.
 //
 // Set MONGO_URI to run against a server you already have; otherwise the suite
 // starts a container and removes it afterwards.
@@ -74,7 +76,7 @@ func (s *MongoStoreSuite) SetupSuite() {
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: mongoImage,
 		Tag:        mongoTag,
-		Cmd:        []string{"--replSet", replicaSet, "--bind_ip_all"},
+		Cmd:        []string{"--bind_ip_all"},
 	}, func(cfg *dc.HostConfig) {
 		cfg.AutoRemove = true
 		cfg.RestartPolicy = dc.RestartPolicy{Name: "no"}
@@ -83,41 +85,14 @@ func (s *MongoStoreSuite) SetupSuite() {
 	s.resource = resource
 	s.Require().NoError(resource.Expire(containerTTL), "set container ttl")
 
-	// directConnection keeps the driver talking to this container instead of
-	// following the replica set's advertised host, which names a port inside
-	// the container that the host cannot reach.
-	s.uri = fmt.Sprintf("mongodb://localhost:%s/?directConnection=true", resource.GetPort("27017/tcp"))
+	s.uri = fmt.Sprintf("mongodb://localhost:%s/", resource.GetPort("27017/tcp"))
 
-	s.initiateReplicaSet()
 	s.waitReady()
 }
 
-// initiateReplicaSet turns the fresh mongod into a single-node replica set and
-// waits for it to elect itself primary. Until it does, every write fails with
-// NotWritablePrimary.
-func (s *MongoStoreSuite) initiateReplicaSet() {
-	s.T().Helper()
-
-	err := s.pool.Retry(func() error {
-		code, err := s.resource.Exec([]string{
-			"mongosh", "--quiet", "--eval",
-			fmt.Sprintf(`try { rs.initiate({_id:%q, members:[{_id:0, host:"localhost:27017"}]}) } `+
-				`catch (e) { if (!/already initialized/i.test(e.message)) throw e }`, replicaSet),
-		}, dockertest.ExecOptions{})
-		if err != nil {
-			return err
-		}
-		if code != 0 {
-			return fmt.Errorf("rs.initiate exited with %d", code)
-		}
-		return nil
-	})
-	s.Require().NoError(err, "initiate replica set")
-}
-
 // waitReady polls until the server accepts a write, not merely a connection.
-// A replica set answers pings well before it has a primary, so pinging alone
-// hands the first test a server that rejects every insert.
+// A mongod answers pings before it is willing to write, so pinging alone hands
+// the first test a server that rejects every insert.
 func (s *MongoStoreSuite) waitReady() {
 	s.T().Helper()
 

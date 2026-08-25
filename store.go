@@ -43,8 +43,8 @@ type MongoStore struct {
 	// caller.
 	ownsClient bool
 
-	// transactional is probed once at construction. A standalone mongod cannot
-	// run transactions, and claiming otherwise would make Set's atomicity a lie.
+	// transactional is probed once at construction and only reported, never
+	// relied on: every operation here is atomic without transactions.
 	transactional bool
 }
 
@@ -171,24 +171,24 @@ func New(opts ...Option) (*MongoStore, error) {
 	return s, nil
 }
 
-// ensureIndexes creates the three compound indexes that cover the eight triple
-// pattern shapes, plus the namespace index.
+// ensureIndexes creates the indexes that cover the eight triple pattern shapes.
 //
-// The (s,p,o,g) index is unique, which is what makes Add idempotent without a
-// read: an upsert on the full key either inserts or does nothing.
+// spg is unique and identifies a document, which is what makes Add an upsert
+// and Set a single-document update. The other two are multikey over the object
+// array: pog serves the predicate-led patterns and og the object-only one.
 func (s *MongoStore) ensureIndexes(ctx context.Context) error {
 	_, err := s.tripl.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "s", Value: 1}, {Key: "p", Value: 1}, {Key: "o", Value: 1}, {Key: "g", Value: 1}},
-			Options: options.Index().SetName("spog").SetUnique(true),
+			Keys:    bson.D{{Key: "s", Value: 1}, {Key: "p", Value: 1}, {Key: "g", Value: 1}},
+			Options: options.Index().SetName("spg").SetUnique(true),
 		},
 		{
-			Keys:    bson.D{{Key: "p", Value: 1}, {Key: "o", Value: 1}, {Key: "s", Value: 1}, {Key: "g", Value: 1}},
-			Options: options.Index().SetName("posg"),
+			Keys:    bson.D{{Key: "p", Value: 1}, {Key: "o", Value: 1}, {Key: "g", Value: 1}},
+			Options: options.Index().SetName("pog"),
 		},
 		{
-			Keys:    bson.D{{Key: "o", Value: 1}, {Key: "s", Value: 1}, {Key: "p", Value: 1}, {Key: "g", Value: 1}},
-			Options: options.Index().SetName("ospg"),
+			Keys:    bson.D{{Key: "o", Value: 1}, {Key: "g", Value: 1}},
+			Options: options.Index().SetName("og"),
 		},
 		{
 			// Contexts and every graph-scoped scan lead with g.
@@ -213,8 +213,11 @@ func (s *MongoStore) ensureIndexes(ctx context.Context) error {
 }
 
 // probeTransactions asks the server what it is. Transactions need a replica set
-// or a sharded cluster; on a standalone mongod they fail at run time, so it is
-// better to know here than to promise something Set cannot deliver.
+// or a sharded cluster; a standalone mongod cannot run them.
+//
+// Nothing in this package depends on the answer — the storage layout is built
+// so that every operation needing atomicity touches exactly one document — but
+// store.Store asks, and answering honestly is free.
 func probeTransactions(ctx context.Context, client *mongo.Client) bool {
 	var hello struct {
 		SetName string `bson:"setName"`
@@ -262,8 +265,11 @@ func (s *MongoStore) fail(op string, err error) {
 func (s *MongoStore) ContextAware() bool { return true }
 
 // TransactionAware reports whether the server this store is connected to can
-// run transactions — that is, whether it is a replica set or a sharded cluster.
-// A standalone mongod cannot, and reports false.
+// run transactions — a replica set or a sharded cluster can, a standalone
+// mongod cannot.
+//
+// It is informational. Set does not need a transaction to be atomic here, so a
+// false answer costs nothing.
 func (s *MongoStore) TransactionAware() bool { return s.transactional }
 
 // graphKey maps a context term to the stored graph key.
@@ -281,6 +287,16 @@ func graphKey(ctx term.Term) string {
 	return term.TermKey(ctx)
 }
 
+// subjectPredicateKey is the filter that identifies one stored document: the
+// subject, predicate and graph a set of objects hangs off.
+func subjectPredicateKey(subj term.Subject, pred term.URIRef, gk string) bson.D {
+	return bson.D{
+		{Key: "s", Value: term.TermKey(subj)},
+		{Key: "p", Value: term.TermKey(pred)},
+		{Key: "g", Value: gk},
+	}
+}
+
 // --- writes ----------------------------------------------------------------
 
 // Add inserts a triple. Adding the same triple twice is a no-op.
@@ -288,9 +304,9 @@ func (s *MongoStore) Add(t term.Triple, ctx term.Term) {
 	c, cancel := s.opCtx()
 	defer cancel()
 
-	filter := tripleDoc(t, graphKey(ctx))
-	_, err := s.tripl.UpdateOne(c, filter,
-		bson.D{{Key: "$setOnInsert", Value: filter}},
+	_, err := s.tripl.UpdateOne(c,
+		subjectPredicateKey(t.Subject, t.Predicate, graphKey(ctx)),
+		bson.D{{Key: "$addToSet", Value: bson.D{{Key: "o", Value: term.TermKey(t.Object)}}}},
 		options.UpdateOne().SetUpsert(true))
 	s.fail("Add", err)
 }
@@ -304,11 +320,43 @@ func (s *MongoStore) AddN(quads []term.Quad) {
 	c, cancel := s.opCtx()
 	defer cancel()
 
+	// Quads that share a subject, predicate and graph land in the same
+	// document, so grouping them here turns what would be one write per quad
+	// into one write per document. A batch of 5000 quads about a handful of
+	// subjects becomes a handful of writes.
+	type group struct {
+		key     bson.D
+		objects bson.A
+		seen    map[string]struct{}
+	}
+	order := make([]string, 0, len(quads))
+	groups := make(map[string]*group, len(quads))
+
+	for _, q := range quads {
+		gk := graphKey(q.Graph)
+		id := term.TermKey(q.Subject) + "\x00" + term.TermKey(q.Predicate) + "\x00" + gk
+		g, ok := groups[id]
+		if !ok {
+			g = &group{
+				key:  subjectPredicateKey(q.Subject, q.Predicate, gk),
+				seen: make(map[string]struct{}),
+			}
+			groups[id] = g
+			order = append(order, id)
+		}
+		ok2 := term.TermKey(q.Object)
+		if _, dup := g.seen[ok2]; dup {
+			continue
+		}
+		g.seen[ok2] = struct{}{}
+		g.objects = append(g.objects, ok2)
+	}
+
 	// Chunked so that one enormous AddN cannot exceed the server's write
-	// command limits. The unique index makes each chunk idempotent, so a retry
-	// or an overlapping chunk changes nothing.
+	// command limits. $addToSet is idempotent, so an overlapping or retried
+	// chunk changes nothing.
 	const chunk = 1000
-	models := make([]mongo.WriteModel, 0, min(chunk, len(quads)))
+	models := make([]mongo.WriteModel, 0, min(chunk, len(order)))
 	flush := func() {
 		if len(models) == 0 {
 			return
@@ -318,11 +366,13 @@ func (s *MongoStore) AddN(quads []term.Quad) {
 		models = models[:0]
 	}
 
-	for _, q := range quads {
-		doc := tripleDoc(q.Triple, graphKey(q.Graph))
+	for _, id := range order {
+		g := groups[id]
 		models = append(models, mongo.NewUpdateOneModel().
-			SetFilter(doc).
-			SetUpdate(bson.D{{Key: "$setOnInsert", Value: doc}}).
+			SetFilter(g.key).
+			SetUpdate(bson.D{{Key: "$addToSet", Value: bson.D{
+				{Key: "o", Value: bson.D{{Key: "$each", Value: g.objects}}},
+			}}}).
 			SetUpsert(true))
 		if len(models) == chunk {
 			flush()
@@ -336,67 +386,60 @@ func (s *MongoStore) Remove(pattern term.TriplePattern, ctx term.Term) {
 	c, cancel := s.opCtx()
 	defer cancel()
 
-	_, err := s.tripl.DeleteMany(c, patternFilter(pattern, ctx))
+	gk := graphKey(ctx)
+	filter := bson.D{{Key: "g", Value: gk}}
+	if pattern.Subject != nil {
+		filter = append(filter, bson.E{Key: "s", Value: term.TermKey(pattern.Subject)})
+	}
+	if pattern.Predicate != nil {
+		filter = append(filter, bson.E{Key: "p", Value: term.TermKey(*pattern.Predicate)})
+	}
+
+	// With the object unbound, every matching document loses all its triples,
+	// so the documents themselves go.
+	if pattern.Object == nil {
+		_, err := s.tripl.DeleteMany(c, filter)
+		s.fail("Remove", err)
+		return
+	}
+
+	// With the object bound, only that element leaves each document. Documents
+	// left holding nothing are then deleted, because an empty one would still
+	// make its graph show up in Contexts.
+	objKey := term.TermKey(pattern.Object)
+	pullFrom := append(filter, bson.E{Key: "o", Value: objKey})
+	if _, err := s.tripl.UpdateMany(c, pullFrom,
+		bson.D{{Key: "$pull", Value: bson.D{{Key: "o", Value: objKey}}}}); err != nil {
+		s.fail("Remove", err)
+		return
+	}
+	_, err := s.tripl.DeleteMany(c, bson.D{
+		{Key: "g", Value: gk},
+		{Key: "o", Value: bson.D{{Key: "$size", Value: 0}}},
+	})
 	s.fail("Remove", err)
 }
 
 // Set replaces every triple matching (s, p, *) in the context with the given
 // triple.
 //
-// On a replica set or a sharded cluster the two operations run in one
-// transaction, so a concurrent reader never sees the interval where the old
-// value is gone and the new one is not yet there. On a standalone mongod —
-// where TransactionAware reports false — that window exists, because the server
-// offers no way to close it.
+// It is a single-document update, and MongoDB makes those atomic on every
+// deployment — standalone included. That is the reason for the storage layout:
+// store.Store requires that a concurrent reader never observe the interval
+// where the old value is gone and the new one is not yet there, and a
+// triple-per-document layout could only deliver that with a transaction, which
+// a standalone mongod cannot run.
 func (s *MongoStore) Set(t term.Triple, ctx term.Term) {
 	c, cancel := s.opCtx()
 	defer cancel()
 
-	gk := graphKey(ctx)
-	del := bson.D{
-		{Key: "s", Value: term.TermKey(t.Subject)},
-		{Key: "p", Value: term.TermKey(t.Predicate)},
-		{Key: "g", Value: gk},
-	}
-	doc := tripleDoc(t, gk)
-
-	apply := func(c context.Context) error {
-		if _, err := s.tripl.DeleteMany(c, del); err != nil {
-			return err
-		}
-		_, err := s.tripl.UpdateOne(c, doc,
-			bson.D{{Key: "$setOnInsert", Value: doc}},
-			options.UpdateOne().SetUpsert(true))
-		return err
-	}
-
-	if !s.transactional {
-		s.fail("Set", apply(c))
-		return
-	}
-
-	sess, err := s.client.StartSession()
-	if err != nil {
-		s.fail("Set", err)
-		return
-	}
-	defer sess.EndSession(c)
-
-	_, err = sess.WithTransaction(c, func(sc context.Context) (any, error) {
-		return nil, apply(sc)
-	})
+	_, err := s.tripl.UpdateOne(c,
+		subjectPredicateKey(t.Subject, t.Predicate, graphKey(ctx)),
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "o", Value: bson.A{term.TermKey(t.Object)}},
+		}}},
+		options.UpdateOne().SetUpsert(true))
 	s.fail("Set", err)
-}
-
-// tripleDoc builds the stored document for a triple, which doubles as the
-// filter that identifies it uniquely.
-func tripleDoc(t term.Triple, gk string) bson.D {
-	return bson.D{
-		{Key: "s", Value: term.TermKey(t.Subject)},
-		{Key: "p", Value: term.TermKey(t.Predicate)},
-		{Key: "o", Value: term.TermKey(t.Object)},
-		{Key: "g", Value: gk},
-	}
 }
 
 // --- namespaces ------------------------------------------------------------

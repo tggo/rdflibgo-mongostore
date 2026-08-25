@@ -78,26 +78,35 @@ stack trace. For anything beyond a URI, call `New` directly.
 
 ## Storage layout
 
-One document per quad, every term written through `term.TermKey`:
+One document per **(subject, predicate, graph)**, holding every object those
+three point at. Every term is written through `term.TermKey`:
 
 ```js
 { s: "U:http://example.org/Alice",
   p: "U:http://example.org/knows",
-  o: "U:http://example.org/Bob",
+  o: ["U:http://example.org/Bob", "U:http://example.org/Carol"],
   g: "" }                                  // "" is the default graph
 ```
 
-Indexes, the same SPO/POS/OSP design the other goRDFlib backends use:
+Not one document per triple — and that is the single most important decision in
+this package. See [Atomicity on a standalone mongod](#atomicity-on-a-standalone-mongod).
 
 ```js
-db.triples.createIndex({s: 1, p: 1, o: 1, g: 1}, {unique: true, name: "spog"})
-db.triples.createIndex({p: 1, o: 1, s: 1, g: 1}, {name: "posg"})
-db.triples.createIndex({o: 1, s: 1, p: 1, g: 1}, {name: "ospg"})
-db.triples.createIndex({g: 1}, {name: "g"})
+db.triples.createIndex({s: 1, p: 1, g: 1}, {unique: true, name: "spg"})
+db.triples.createIndex({p: 1, o: 1, g: 1}, {name: "pog"})   // multikey over o
+db.triples.createIndex({o: 1, g: 1},       {name: "og"})    // multikey over o
+db.triples.createIndex({g: 1},             {name: "g"})
 ```
 
-The unique index is what makes `Add` idempotent without a read: it is an upsert
-on the full key.
+`spg` identifies a document, which is what makes `Add` an upsert with
+`$addToSet` — idempotent without a read — and `Set` a single-document update.
+The other two are multikey indexes over the object array, so a bound object
+matches by containment.
+
+The cost of the layout is MongoDB's 16 MiB document limit: it caps how many
+objects one subject and predicate may have in a single graph, on the order of a
+hundred thousand. Exceeding it is a write error reported through the error
+handler, not silent loss.
 
 Namespace bindings live in a second collection keyed by prefix.
 
@@ -132,15 +141,18 @@ The aggregation, roughly:
 ```js
 db.triples.aggregate([
   { $match: { s: startKey, p: predKey, g: "" } },
+  { $unwind: "$o" },                                  // objects are an array
   { $group: { _id: null, seeds: { $addToSet: "$o" } } },
   { $graphLookup: {
       from: "triples",
       startWith: "$seeds",
-      connectFromField: "o",
+      connectFromField: "o",                          // array: every element is followed
       connectToField: "s",
       restrictSearchWithMatch: { p: predKey, g: "" },
       as: "reached" } },
-  { $project: { nodes: { $setUnion: ["$seeds", "$reached.o"] } } },
+  { $project: { nodes: { $setUnion: ["$seeds",
+      { $reduce: { input: "$reached.o", initialValue: [],
+                   in: { $setUnion: ["$$value", "$$this"] } } }] } } },
   { $unwind: "$nodes" },
   { $group: { _id: "$nodes" } }
 ])
@@ -148,7 +160,9 @@ db.triples.aggregate([
 
 Collecting the seeds into one array first matters: running `$graphLookup` once
 per matching edge would materialize the reached set once per edge and hit the
-stage's memory cap at a fraction of the graph size.
+stage's memory cap at a fraction of the graph size. The final `$unwind` streams
+one document per node instead of returning one array, which would be bounded by
+the 16 MiB reply limit.
 
 Cycles need no handling — `$graphLookup` never revisits a document.
 
@@ -159,20 +173,35 @@ goRDFlib falls back to its own traversal. The contract is all-or-nothing —
 a complete result or an error, never a truncated one — precisely so the caller
 can fall back without double-counting.
 
-Measured on a laptop against `mongo:8` in Docker: the closure over a 2000-edge
-chain takes ~55 ms, one round trip.
+Because the objects live in an array, the forward direction flattens
+`$reached.o` with a `$reduce`; the inverse direction needs no flattening, since
+`connectToField` matches an array by containment.
 
-## Transactions
+Measured on a laptop against a standalone `mongo:8` in Docker: the closure over
+a 2000-edge chain takes ~180 ms, one round trip.
 
-`Set` must replace `(s, p, *)` atomically, so that a concurrent reader never
-sees the moment where the old value is gone and the new one is not yet there.
-That needs a transaction, and transactions need a replica set or a sharded
-cluster.
+## Atomicity on a standalone mongod
 
-`TransactionAware()` reports what the connected server can actually do, probed
-once at construction. On a standalone `mongod` it returns false and `Set` runs
-its two operations unprotected, because the server offers no way to close that
-window. Run a replica set if it matters — even a single-node one.
+`store.Store` requires `Set` to replace `(s, p, *)` such that a concurrent
+reader never sees the moment where the old value is gone and the new one is not
+yet there.
+
+With one document per triple that is a delete plus an insert — two documents,
+so two operations, so a transaction. **Transactions need a replica set or a
+sharded cluster; a standalone `mongod` cannot run them.** A backend built that
+way passes its tests against a replica set and loses the guarantee in
+production.
+
+Grouping the objects of a subject and predicate into one document turns `Set`
+into a single `updateOne`, and MongoDB makes single-document updates atomic on
+every deployment, standalone included. That is the whole reason for the layout.
+
+`TransactionAware()` still probes the server and answers honestly — false on a
+standalone. Nothing in this package depends on the answer.
+
+The suite runs a standalone deliberately, and
+`TestSetIsASingleDocumentUpdate` hammers `Set` from one goroutine while another
+reads, asserting the value is never absent.
 
 ## Tests
 
@@ -181,11 +210,12 @@ never points it at a server proves nothing.
 
 ```bash
 make test                       # starts mongo:8 in Docker via dockertest
-MONGO_URI=mongodb://localhost:27017/?directConnection=true make test
+MONGO_URI=mongodb://localhost:27017/ make test
 ```
 
-The suite runs a **single-node replica set**, not a standalone, so that `Set`'s
-transactional path is the one under test rather than the fallback.
+The container is a **plain standalone**, matching the deployments this backend
+targets. Testing against a replica set would let a design that quietly depends
+on transactions pass here and fail where it matters.
 
 The load-bearing test is `TestConformance`, which runs goRDFlib's shared
 `store/storetest` suite — the same suite the in-memory, Badger, SQLite and
@@ -193,12 +223,10 @@ SPARQL-protocol backends run. It passes with **no declared exemptions**, and it
 should stay that way: a failure there belongs in this store, not in a
 `storetest.Config.Known` entry.
 
-## Status
+## Compatibility
 
-The `go.mod` carries a `replace` to a local checkout of goRDFlib, because this
-backend depends on `store/storetest` and `store.ReachabilityStore`, which are on
-goRDFlib's main branch and not yet in a tagged release. Remove the `replace` and
-pin a version once one is cut.
+Requires goRDFlib **v0.2.0 or later**, which is where `store/storetest` and
+`store.ReachabilityStore` were introduced.
 
 ## License
 

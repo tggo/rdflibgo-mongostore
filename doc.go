@@ -9,21 +9,35 @@
 //
 // # Storage layout
 //
-// Triples live in one collection, one document per quad, with every term
-// written through term.TermKey:
+// Triples live in one collection, one document per (subject, predicate, graph),
+// holding every object those three point at. Every term is written through
+// term.TermKey:
 //
 //	{ s: "U:http://example.org/Alice",
 //	  p: "U:http://example.org/knows",
-//	  o: "U:http://example.org/Bob",
+//	  o: ["U:http://example.org/Bob", "U:http://example.org/Carol"],
 //	  g: "" }
+//
+// It is not one document per triple, and the reason is atomicity. store.Store
+// requires Set to replace (s, p, *) without a concurrent reader ever seeing the
+// interval where the old value is gone and the new one is not yet there. Across
+// several documents that needs a transaction, and a standalone mongod cannot
+// run one — transactions require a replica set or a sharded cluster. Grouped
+// this way, Set is a single-document update, which MongoDB makes atomic on
+// every deployment.
 //
 // The empty string in g is the default graph, following the convention the
 // other goRDFlib backends use: both a nil context and a blank node context mean
 // the default graph, because a blank node cannot name a graph.
 //
-// Three compound indexes cover the eight triple pattern shapes — (s,p,o,g)
-// unique, (p,o,s,g), and (o,s,p,g) — which is the same SPO/POS/OSP design the
-// in-memory, Badger and SQLite backends use.
+// The indexes cover the eight triple pattern shapes: (s,p,g) unique — it
+// identifies a document and makes Add an upsert — plus the multikey (p,o,g) and
+// (o,g) over the object array, and (g) for the graph-led scans.
+//
+// The cost of the layout is MongoDB's 16 MiB document limit: it caps how many
+// objects a single subject and predicate may have in one graph. Reaching that
+// takes on the order of a hundred thousand objects on one (s, p) pair, and it
+// surfaces as a write error through the handler rather than as silent loss.
 //
 // Namespace bindings live in a second collection keyed by prefix.
 //

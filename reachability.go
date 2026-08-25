@@ -26,6 +26,11 @@ import (
 // the reached set is materialized once per edge, and the stage's memory cap is
 // hit at a fraction of the graph size.
 //
+// The storage layout puts the objects of one subject and predicate in an array,
+// which $graphLookup handles natively in both directions: traversing forward it
+// follows every element of connectFromField, and traversing backwards it
+// matches connectToField by array containment.
+//
 // # When it declines
 //
 // $graphLookup is capped at 100 MiB per stage and ignores allowDiskUse, so a
@@ -61,13 +66,16 @@ func (s *MongoStore) Reachable(q store.ReachabilityQuery) ([]term.Term, error) {
 	seedMatch := bson.D{{Key: "g", Value: gk}, {Key: toField, Value: startKey}}
 	seedMatch = append(seedMatch, predMatch...)
 
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$match", Value: seedMatch}},
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: nil},
-			{Key: "seeds", Value: bson.D{{Key: "$addToSet", Value: "$" + fromField}}},
-		}}},
+	pipeline := mongo.Pipeline{bson.D{{Key: "$match", Value: seedMatch}}}
+	if !q.Inverse {
+		// Forward, the far end is the object array, so it has to be flattened
+		// before it can be collected into a set of seed nodes.
+		pipeline = append(pipeline, bson.D{{Key: "$unwind", Value: "$o"}})
 	}
+	pipeline = append(pipeline, bson.D{{Key: "$group", Value: bson.D{
+		{Key: "_id", Value: nil},
+		{Key: "seeds", Value: bson.D{{Key: "$addToSet", Value: "$" + fromField}}},
+	}}})
 
 	// MaxDepth counts hops from Start. The $match above is hop 1, so the lookup
 	// covers hops 2..MaxDepth and its own maxDepth — which counts recursion
@@ -89,10 +97,23 @@ func (s *MongoStore) Reachable(q store.ReachabilityQuery) ([]term.Term, error) {
 		if q.MaxDepth >= 2 {
 			lookup = append(lookup, bson.E{Key: "maxDepth", Value: int64(q.MaxDepth - 2)})
 		}
+
+		// Collecting the far ends of the reached documents. Forward, "$reached.o"
+		// is an array of arrays and has to be flattened; inverse, "$reached.s" is
+		// already a flat list of subjects.
+		var reachedNodes any = "$reached." + fromField
+		if !q.Inverse {
+			reachedNodes = bson.D{{Key: "$reduce", Value: bson.D{
+				{Key: "input", Value: "$reached.o"},
+				{Key: "initialValue", Value: bson.A{}},
+				{Key: "in", Value: bson.D{{Key: "$setUnion", Value: bson.A{"$$value", "$$this"}}}},
+			}}}
+		}
+
 		pipeline = append(pipeline,
 			bson.D{{Key: "$graphLookup", Value: lookup}},
 			bson.D{{Key: "$project", Value: bson.D{
-				{Key: "nodes", Value: bson.D{{Key: "$setUnion", Value: bson.A{"$seeds", "$reached." + fromField}}}},
+				{Key: "nodes", Value: bson.D{{Key: "$setUnion", Value: bson.A{"$seeds", reachedNodes}}}},
 			}}},
 		)
 	} else {

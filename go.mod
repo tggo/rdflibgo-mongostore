@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/stretchr/testify v1.12.1
-	github.com/tggo/goRDFlib v0.0.0
+	github.com/tggo/goRDFlib v0.2.0
 	go.mongodb.org/mongo-driver/v2 v2.8.1
 )
 
@@ -47,5 +47,3 @@ require (
 	golang.org/x/text v0.22.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace github.com/tggo/goRDFlib => ../rdflibgo
