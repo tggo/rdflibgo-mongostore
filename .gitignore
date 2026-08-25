@@ -1,0 +1,10 @@
+*.test
+*.out
+*.prof
+.DS_Store
+.idea/
+.vscode/
+*.iml
+fix.plan.md
+plan.md
+tmp/
