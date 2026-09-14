@@ -441,15 +441,17 @@ func (s *MongoStoreSuite) TestDocumentLayout() {
 		s.Equal(int64(1), n)
 	})
 
-	s.Run("a blank node context is folded into the default graph", func() {
-		st.Add(triple(uri("Erin"), uri("knows"), uri("Frank")), term.NewBNode())
-		s.Equal(4, st.Len(nil), "a blank node cannot name a graph")
+	bn := term.NewBNode()
+	s.Run("a blank node context is a named graph", func() {
+		st.Add(triple(uri("Erin"), uri("knows"), uri("Frank")), bn)
+		s.Equal(3, st.Len(nil), "a blank node names a graph")
+		s.Equal(1, st.Len(bn))
 	})
 
 	s.Run("removing the last object removes the document", func() {
 		st.Remove(term.TriplePattern{
 			Subject: uri("Erin"), Predicate: predPtr(uri("knows")), Object: uri("Frank"),
-		}, nil)
+		}, bn)
 
 		n, err := st.Collection().CountDocuments(ctx,
 			bson.D{{Key: "s", Value: term.TermKey(uri("Erin"))}})

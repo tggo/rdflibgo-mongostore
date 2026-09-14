@@ -110,11 +110,15 @@ handler, not silent loss.
 
 Namespace bindings live in a second collection keyed by prefix.
 
-Two conventions come from goRDFlib and are not negotiable if the store is to
-behave like the others: a **nil context means the default graph**, not every
-graph, and a **blank node context means the default graph too** — a blank node
-cannot name a graph, and `Graph` passes its own identifier, a blank node when
-the graph is unnamed, straight through as the context.
+Two conventions come from goRDFlib (v0.5.3 and later) and are not negotiable if
+the store is to behave like the others: a **nil context and `store.DefaultGraph`
+mean the default graph**, not every graph, and **any other context names a
+graph, a blank node included** (TriG `_:g { }`). `Graph` gives unnamed graphs
+the `store.DefaultGraph` identifier and passes it straight through as the
+context.
+
+Documents written by earlier versions need no migration: blank node contexts
+were always stored under the default graph key.
 
 `Collection()` exposes the underlying `*mongo.Collection` for the things
 `store.Store` cannot express: a custom aggregation, a backup, an extra index.

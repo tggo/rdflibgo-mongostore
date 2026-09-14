@@ -22,8 +22,8 @@ const (
 	namespacesCollection = "namespaces"
 )
 
-// defaultGraphKey is what the default graph is called on disk. Both a nil
-// context and a blank node context map to it.
+// defaultGraphKey is what the default graph is called on disk. A nil context
+// and store.DefaultGraph map to it.
 const defaultGraphKey = ""
 
 // MongoStore implements store.Store on top of MongoDB.
@@ -274,14 +274,11 @@ func (s *MongoStore) TransactionAware() bool { return s.transactional }
 
 // graphKey maps a context term to the stored graph key.
 //
-// nil is the default graph, and so is a blank node: blank nodes cannot name a
-// graph, and Graph passes its own identifier — a BNode when the graph is
-// unnamed — straight through as the context.
+// nil and store.DefaultGraph address the default graph (goRDFlib v0.5.3 gives
+// unnamed graphs that identifier). Any other term, a blank node included,
+// names a graph: TriG allows `_:g { }`.
 func graphKey(ctx term.Term) string {
-	if ctx == nil {
-		return defaultGraphKey
-	}
-	if _, isBNode := ctx.(term.BNode); isBNode {
+	if store.IsDefaultGraph(ctx) {
 		return defaultGraphKey
 	}
 	return term.TermKey(ctx)

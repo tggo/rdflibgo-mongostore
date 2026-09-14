@@ -27,8 +27,8 @@
 // every deployment.
 //
 // The empty string in g is the default graph, following the convention the
-// other goRDFlib backends use: both a nil context and a blank node context mean
-// the default graph, because a blank node cannot name a graph.
+// other goRDFlib backends use: a nil context and store.DefaultGraph mean the
+// default graph, and any other context, a blank node included, names a graph.
 //
 // The indexes cover the eight triple pattern shapes: (s,p,g) unique — it
 // identifies a document and makes Add an upsert — plus the multikey (p,o,g) and
