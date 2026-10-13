@@ -1,6 +1,7 @@
 package mongostore
 
 import (
+	"context"
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -43,7 +44,10 @@ import (
 //
 // Cycles need no special handling. $graphLookup performs a breadth-first search
 // and never revisits a document it has already seen.
-func (s *MongoStore) Reachable(q store.ReachabilityQuery) ([]term.Term, error) {
+func (s *MongoStore) Reachable(ctx context.Context, q store.ReachabilityQuery) ([]term.Term, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if q.Start == nil {
 		return nil, fmt.Errorf("mongostore: %w: no start node", store.ErrReachabilityUnsupported)
 	}
@@ -129,7 +133,7 @@ func (s *MongoStore) Reachable(q store.ReachabilityQuery) ([]term.Term, error) {
 		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$nodes"}}}},
 	)
 
-	c, cancel := s.opCtx()
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	cur, err := s.tripl.Aggregate(c, pipeline)

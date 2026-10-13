@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/tggo/goRDFlib/graph"
 	"github.com/tggo/goRDFlib/plugin"
@@ -42,7 +44,7 @@ func (s *MongoStoreSuite) TestNew() {
 
 	s.Run("creates the index shapes the pattern lookups need", func() {
 		st := s.newStore(s.T())
-		st.Add(triple(uri("a"), uri("p"), uri("b")), nil)
+		s.Require().NoError(st.Add(context.Background(), triple(uri("a"), uri("p"), uri("b")), nil))
 
 		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 		defer cancel()
@@ -71,10 +73,10 @@ func (s *MongoStoreSuite) TestNew() {
 	s.Run("is idempotent over an existing database", func() {
 		db := s.nextDB()
 		first := s.newStoreInDB(s.T(), db)
-		first.Add(triple(uri("a"), uri("p"), uri("b")), nil)
+		s.Require().NoError(first.Add(context.Background(), triple(uri("a"), uri("p"), uri("b")), nil))
 
 		second := s.newStoreInDB(s.T(), db)
-		s.Equal(1, second.Len(nil), "a second New over the same database must see the data")
+		s.Equal(1, mustV(second.Len(context.Background(), nil)), "a second New over the same database must see the data")
 	})
 
 	s.Run("reports a standalone server as non-transactional", func() {
@@ -87,42 +89,129 @@ func (s *MongoStoreSuite) TestNew() {
 
 // --- error reporting -------------------------------------------------------
 
-func (s *MongoStoreSuite) TestErrorHandler() {
-	s.Run("a write failure reaches the handler", func() {
-		// store.Store cannot return a write error, so a backend that does not
-		// report it loses data in silence. Cancelling the base context is the
-		// cheapest way to make every operation fail.
-		ctx, cancel := context.WithCancel(context.Background())
-
-		var got []string
-		st, err := mongostore.New(
-			mongostore.WithURI(s.uri),
-			mongostore.WithDatabase(s.nextDB()),
-			mongostore.WithContext(ctx),
-			mongostore.WithErrorHandler(func(op string, err error) {
-				got = append(got, op)
-			}),
-		)
+// A store that cannot reach its server must say so. Before v0.9 store.Store
+// had no error path, so Len returned 0 and Triples yielded nothing, and a
+// caller could not tell a dead server from an empty graph.
+func (s *MongoStoreSuite) TestBackendFailureSurfaces() {
+	// A client the caller supplied and then disconnected is the cheapest
+	// real driver failure: every command fails with mongo.ErrClientDisconnected.
+	dead := func() *mongostore.MongoStore {
+		client, err := mongo.Connect(options.Client().ApplyURI(s.uri))
 		s.Require().NoError(err)
-		defer st.Close()
+		st, err := mongostore.New(mongostore.WithClient(client), mongostore.WithDatabase(s.nextDB()))
+		s.Require().NoError(err)
+		s.Require().NoError(client.Disconnect(context.Background()))
+		return st
+	}
+	ctx := context.Background()
+	p := term.TriplePattern{}
 
-		cancel()
-		st.Add(triple(uri("a"), uri("p"), uri("b")), nil)
-		st.AddN([]term.Quad{{Triple: triple(uri("a"), uri("p"), uri("c"))}})
-		st.Remove(term.TriplePattern{}, nil)
-		st.Bind("ex", uri("ns"))
-
-		s.Subset(got, []string{"Add", "AddN", "Remove", "Bind"},
-			"every write that failed must be reported; got %v", got)
+	s.Run("writes return the driver error", func() {
+		st := dead()
+		t := triple(uri("a"), uri("p"), uri("b"))
+		s.ErrorIs(st.Add(ctx, t, nil), mongo.ErrClientDisconnected)
+		s.ErrorIs(st.AddN(ctx, []term.Quad{{Triple: t}}), mongo.ErrClientDisconnected)
+		s.ErrorIs(st.Set(ctx, t, nil), mongo.ErrClientDisconnected)
+		s.ErrorIs(st.Remove(ctx, p, nil), mongo.ErrClientDisconnected)
+		s.ErrorIs(st.Bind(ctx, "ex", uri("ns")), mongo.ErrClientDisconnected)
 	})
 
-	s.Run("a missing namespace is not an error", func() {
-		st := s.newStore(s.T()) // its handler fails the test on any report
-		_, ok := st.Namespace("absent")
-		s.False(ok)
-		_, ok = st.Prefix(uri("absent"))
-		s.False(ok)
+	s.Run("reads return the driver error", func() {
+		st := dead()
+		_, err := st.Len(ctx, nil)
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		_, err = st.Count(ctx, p, nil)
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		_, err = st.Exists(ctx, p, nil)
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		_, _, err = st.Namespace(ctx, "ex")
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		_, _, err = st.Prefix(ctx, uri("ns"))
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		_, err = st.Reachable(ctx, store.ReachabilityQuery{Start: uri("a")})
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
 	})
+
+	s.Run("iterators yield one error and stop", func() {
+		st := dead()
+		iterators := map[string]func(yield func(any, error) bool){
+			"Triples": func(yield func(any, error) bool) {
+				for v, err := range st.Triples(ctx, p, nil) {
+					if !yield(v, err) {
+						return
+					}
+				}
+			},
+			"TriplesWithLimit": func(yield func(any, error) bool) {
+				for v, err := range st.TriplesWithLimit(ctx, p, nil, 10, 0) {
+					if !yield(v, err) {
+						return
+					}
+				}
+			},
+			"Contexts": func(yield func(any, error) bool) {
+				for v, err := range st.Contexts(ctx, nil) {
+					if !yield(v, err) {
+						return
+					}
+				}
+			},
+			"Namespaces": func(yield func(any, error) bool) {
+				for v, err := range st.Namespaces(ctx) {
+					if !yield(v, err) {
+						return
+					}
+				}
+			},
+		}
+		for name, it := range iterators {
+			var errs int
+			it(func(_ any, err error) bool {
+				if err != nil {
+					s.ErrorIs(err, mongo.ErrClientDisconnected, name)
+					errs++
+				}
+				return true
+			})
+			s.Equal(1, errs, "%s must yield exactly one error", name)
+		}
+	})
+
+	s.Run("graph.Graph reports it instead of looking empty", func() {
+		g := graph.NewGraph(graph.WithStore(dead()))
+		_, err := g.Len(ctx)
+		s.ErrorIs(err, mongo.ErrClientDisconnected)
+		s.ErrorIs(g.Add(ctx, uri("a"), uri("p"), uri("b")), mongo.ErrClientDisconnected)
+	})
+}
+
+func (s *MongoStoreSuite) TestDoneContextHasNoSideEffects() {
+	st := s.newStore(s.T())
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s.ErrorIs(st.Add(done, triple(uri("a"), uri("p"), uri("b")), nil), context.Canceled)
+	s.ErrorIs(st.Bind(done, "ex", uri("ns")), context.Canceled)
+	n, err := st.Len(context.Background(), nil)
+	s.Require().NoError(err)
+	s.Zero(n, "a refused Add must write nothing")
+	_, ok, err := st.Namespace(context.Background(), "ex")
+	s.Require().NoError(err)
+	s.False(ok, "a refused Bind must write nothing")
+
+	for _, err := range st.Triples(done, term.TriplePattern{}, nil) {
+		s.ErrorIs(err, context.Canceled)
+	}
+}
+
+func (s *MongoStoreSuite) TestMissingNamespaceIsNotAnError() {
+	st := s.newStore(s.T())
+	_, ok, err := st.Namespace(context.Background(), "absent")
+	s.NoError(err)
+	s.False(ok)
+	_, ok, err = st.Prefix(context.Background(), uri("absent"))
+	s.NoError(err)
+	s.False(ok)
 }
 
 // --- $graphLookup ----------------------------------------------------------
@@ -134,14 +223,14 @@ func (s *MongoStoreSuite) TestErrorHandler() {
 //	d --q--> e
 //	c --p--> "leaf"
 func (s *MongoStoreSuite) reachGraph(st *mongostore.MongoStore, ctx term.Subject) {
-	st.AddN([]term.Quad{
+	s.Require().NoError(st.AddN(context.Background(), []term.Quad{
 		{Triple: triple(uri("a"), uri("p"), uri("b")), Graph: ctx},
 		{Triple: triple(uri("b"), uri("p"), uri("c")), Graph: ctx},
 		{Triple: triple(uri("c"), uri("p"), uri("a")), Graph: ctx},
 		{Triple: triple(uri("b"), uri("p"), uri("d")), Graph: ctx},
 		{Triple: triple(uri("d"), uri("q"), uri("e")), Graph: ctx},
 		{Triple: triple(uri("c"), uri("p"), term.NewLiteral("leaf")), Graph: ctx},
-	})
+	}))
 }
 
 func (s *MongoStoreSuite) TestReachable() {
@@ -149,7 +238,7 @@ func (s *MongoStoreSuite) TestReachable() {
 	s.reachGraph(st, nil)
 
 	reach := func(q store.ReachabilityQuery) []string {
-		got, err := st.Reachable(q)
+		got, err := st.Reachable(context.Background(), q)
 		s.Require().NoError(err)
 		out := keys(got)
 		sort.Strings(out)
@@ -227,7 +316,7 @@ func (s *MongoStoreSuite) TestReachable() {
 	})
 
 	s.Run("a start with no bound node is refused", func() {
-		_, err := st.Reachable(store.ReachabilityQuery{Predicates: []term.URIRef{p}})
+		_, err := st.Reachable(context.Background(), store.ReachabilityQuery{Predicates: []term.URIRef{p}})
 		s.ErrorIs(err, store.ErrReachabilityUnsupported,
 			"declining must be reported as ErrReachabilityUnsupported so the caller falls back")
 	})
@@ -237,11 +326,11 @@ func (s *MongoStoreSuite) TestReachableIsGraphScoped() {
 	st := s.newStore(s.T())
 	g1 := uri("graph1")
 
-	st.Add(triple(uri("a"), uri("p"), uri("b")), g1)
-	st.Add(triple(uri("b"), uri("p"), uri("c")), nil) // default graph
+	s.Require().NoError(st.Add(context.Background(), triple(uri("a"), uri("p"), uri("b")), g1))
+	s.Require().NoError(st.Add(context.Background(), triple(uri("b"), uri("p"), uri("c")), nil)) // default graph
 
 	s.Run("a named graph sees only its own edges", func() {
-		got, err := st.Reachable(store.ReachabilityQuery{
+		got, err := st.Reachable(context.Background(), store.ReachabilityQuery{
 			Start: uri("a"), Predicates: []term.URIRef{uri("p")}, Context: g1,
 		})
 		s.Require().NoError(err)
@@ -250,7 +339,7 @@ func (s *MongoStoreSuite) TestReachableIsGraphScoped() {
 	})
 
 	s.Run("the default graph sees only its own edges", func() {
-		got, err := st.Reachable(store.ReachabilityQuery{
+		got, err := st.Reachable(context.Background(), store.ReachabilityQuery{
 			Start: uri("a"), Predicates: []term.URIRef{uri("p")},
 		})
 		s.Require().NoError(err)
@@ -270,10 +359,10 @@ func (s *MongoStoreSuite) TestReachableDeepChain() {
 		quads = append(quads, term.Quad{Triple: triple(
 			uri(fmt.Sprintf("n%d", i)), uri("p"), uri(fmt.Sprintf("n%d", i+1)))})
 	}
-	st.AddN(quads)
+	s.Require().NoError(st.AddN(context.Background(), quads))
 
 	start := time.Now()
-	got, err := st.Reachable(store.ReachabilityQuery{
+	got, err := st.Reachable(context.Background(), store.ReachabilityQuery{
 		Start: uri("n0"), Predicates: []term.URIRef{uri("p")},
 	})
 	s.Require().NoError(err)
@@ -290,10 +379,10 @@ func (s *MongoStoreSuite) TestPropertyPathThroughSPARQL() {
 	st := s.newStore(s.T())
 	g := graph.NewGraph(graph.WithStore(st))
 
-	g.Add(uri("a"), uri("knows"), uri("b"))
-	g.Add(uri("b"), uri("knows"), uri("c"))
-	g.Add(uri("c"), uri("knows"), uri("d"))
-	g.Add(uri("d"), uri("likes"), uri("e"))
+	s.Require().NoError(g.Add(context.Background(), uri("a"), uri("knows"), uri("b")))
+	s.Require().NoError(g.Add(context.Background(), uri("b"), uri("knows"), uri("c")))
+	s.Require().NoError(g.Add(context.Background(), uri("c"), uri("knows"), uri("d")))
+	s.Require().NoError(g.Add(context.Background(), uri("d"), uri("likes"), uri("e")))
 
 	ask := func(query string) []string {
 		res, err := sparql.Query(g, query)
@@ -351,15 +440,15 @@ func (s *MongoStoreSuite) TestGraphAndSPARQLOverMongo() {
 	st := s.newStore(s.T())
 	g := graph.NewGraph(graph.WithStore(st))
 
-	g.Add(uri("Alice"), uri("name"), term.NewLiteral("Alice"))
-	g.Add(uri("Alice"), uri("age"), term.NewLiteral(30))
-	g.Add(uri("Bob"), uri("name"), term.NewLiteral("Bob"))
-	g.Add(uri("Bob"), uri("knows"), uri("Alice"))
+	s.Require().NoError(g.Add(context.Background(), uri("Alice"), uri("name"), term.NewLiteral("Alice")))
+	s.Require().NoError(g.Add(context.Background(), uri("Alice"), uri("age"), term.NewLiteral(30)))
+	s.Require().NoError(g.Add(context.Background(), uri("Bob"), uri("name"), term.NewLiteral("Bob")))
+	s.Require().NoError(g.Add(context.Background(), uri("Bob"), uri("knows"), uri("Alice")))
 
 	s.Run("Graph reads what it wrote", func() {
-		s.Equal(4, g.Len())
-		s.True(g.Contains(uri("Bob"), uri("knows"), uri("Alice")))
-		s.Equal(2, countTriples(g.Triples(uri("Alice"), nil, nil)))
+		s.Equal(4, mustV(g.Len(context.Background())))
+		s.True(g.Contains(context.Background(), uri("Bob"), uri("knows"), uri("Alice")))
+		s.Equal(2, countTriples(s.T(), g.Triples(context.Background(), uri("Alice"), nil, nil)))
 	})
 
 	s.Run("SELECT over the store", func() {
@@ -372,15 +461,15 @@ func (s *MongoStoreSuite) TestGraphAndSPARQLOverMongo() {
 
 	s.Run("a literal with quotes survives the round trip", func() {
 		lit := term.NewLiteral(`he said "hi"`)
-		g.Add(uri("Alice"), uri("quote"), lit)
-		got, ok := g.Value(uri("Alice"), predPtr(uri("quote")), nil)
+		s.Require().NoError(g.Add(context.Background(), uri("Alice"), uri("quote"), lit))
+		got, ok, _ := g.Value(context.Background(), uri("Alice"), predPtr(uri("quote")), nil)
 		s.Require().True(ok)
 		s.Equal(lit.N3(), got.N3())
 	})
 
 	s.Run("Set replaces a single value", func() {
-		g.Set(uri("Alice"), uri("age"), term.NewLiteral(31))
-		s.Equal(1, countTriples(g.Triples(uri("Alice"), predPtr(uri("age")), nil)))
+		s.Require().NoError(g.Set(context.Background(), uri("Alice"), uri("age"), term.NewLiteral(31)))
+		s.Equal(1, countTriples(s.T(), g.Triples(context.Background(), uri("Alice"), predPtr(uri("age")), nil)))
 	})
 }
 
@@ -395,10 +484,10 @@ func (s *MongoStoreSuite) TestGraphAndSPARQLOverMongo() {
 // makes Set atomic without a transaction — see TestSetIsASingleDocumentUpdate.
 func (s *MongoStoreSuite) TestDocumentLayout() {
 	st := s.newStore(s.T())
-	st.Add(triple(uri("Alice"), uri("knows"), uri("Bob")), nil)
-	st.Add(triple(uri("Alice"), uri("knows"), uri("Carol")), nil)
-	st.Add(triple(uri("Alice"), uri("name"), term.NewLiteral("Alice")), nil)
-	st.Add(triple(uri("Alice"), uri("knows"), uri("Dave")), uri("graph1"))
+	s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("knows"), uri("Bob")), nil))
+	s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("knows"), uri("Carol")), nil))
+	s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("name"), term.NewLiteral("Alice")), nil))
+	s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("knows"), uri("Dave")), uri("graph1")))
 
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
@@ -430,8 +519,8 @@ func (s *MongoStoreSuite) TestDocumentLayout() {
 		s.Require().NoError(err)
 		s.Equal(int64(3), n,
 			"four triples over three (s,p,g) combinations must be three documents")
-		s.Equal(3, st.Len(nil), "three triples in the default graph")
-		s.Equal(1, st.Len(uri("graph1")))
+		s.Equal(3, mustV(st.Len(context.Background(), nil)), "three triples in the default graph")
+		s.Equal(1, mustV(st.Len(context.Background(), uri("graph1"))))
 	})
 
 	s.Run("a named graph is stored under its own key", func() {
@@ -443,15 +532,15 @@ func (s *MongoStoreSuite) TestDocumentLayout() {
 
 	bn := term.NewBNode()
 	s.Run("a blank node context is a named graph", func() {
-		st.Add(triple(uri("Erin"), uri("knows"), uri("Frank")), bn)
-		s.Equal(3, st.Len(nil), "a blank node names a graph")
-		s.Equal(1, st.Len(bn))
+		s.Require().NoError(st.Add(context.Background(), triple(uri("Erin"), uri("knows"), uri("Frank")), bn))
+		s.Equal(3, mustV(st.Len(context.Background(), nil)), "a blank node names a graph")
+		s.Equal(1, mustV(st.Len(context.Background(), bn)))
 	})
 
 	s.Run("removing the last object removes the document", func() {
-		st.Remove(term.TriplePattern{
+		s.Require().NoError(st.Remove(context.Background(), term.TriplePattern{
 			Subject: uri("Erin"), Predicate: predPtr(uri("knows")), Object: uri("Frank"),
-		}, bn)
+		}, bn))
 
 		n, err := st.Collection().CountDocuments(ctx,
 			bson.D{{Key: "s", Value: term.TermKey(uri("Erin"))}})
@@ -471,17 +560,17 @@ func (s *MongoStoreSuite) TestSetIsASingleDocumentUpdate() {
 	st := s.newStore(s.T())
 
 	s.Run("Set collapses many values into one", func() {
-		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(29)), nil)
-		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(30)), nil)
-		st.Add(triple(uri("Alice"), uri("age"), term.NewLiteral(31)), nil)
-		s.Equal(3, st.Len(nil))
+		s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("age"), term.NewLiteral(29)), nil))
+		s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("age"), term.NewLiteral(30)), nil))
+		s.Require().NoError(st.Add(context.Background(), triple(uri("Alice"), uri("age"), term.NewLiteral(31)), nil))
+		s.Equal(3, mustV(st.Len(context.Background(), nil)))
 
-		st.Set(triple(uri("Alice"), uri("age"), term.NewLiteral(32)), nil)
-		s.Equal(1, st.Len(nil))
+		s.Require().NoError(st.Set(context.Background(), triple(uri("Alice"), uri("age"), term.NewLiteral(32)), nil))
+		s.Equal(1, mustV(st.Len(context.Background(), nil)))
 	})
 
 	s.Run("a concurrent reader never sees zero values", func() {
-		st.Set(triple(uri("Bob"), uri("age"), term.NewLiteral(1)), nil)
+		s.Require().NoError(st.Set(context.Background(), triple(uri("Bob"), uri("age"), term.NewLiteral(1)), nil))
 
 		pattern := term.TriplePattern{Subject: uri("Bob"), Predicate: predPtr(uri("age"))}
 		done := make(chan struct{})
@@ -490,7 +579,7 @@ func (s *MongoStoreSuite) TestSetIsASingleDocumentUpdate() {
 		go func() {
 			defer close(done)
 			for i := 2; i < 60; i++ {
-				st.Set(triple(uri("Bob"), uri("age"), term.NewLiteral(i)), nil)
+				s.NoError(st.Set(context.Background(), triple(uri("Bob"), uri("age"), term.NewLiteral(i)), nil))
 			}
 		}()
 
@@ -501,7 +590,7 @@ func (s *MongoStoreSuite) TestSetIsASingleDocumentUpdate() {
 					"a reader saw the value missing %d times; Set is not atomic", missing)
 				return
 			default:
-				if countTriples(st.Triples(pattern, nil)) == 0 {
+				if countTriples(s.T(), st.Triples(context.Background(), pattern, nil)) == 0 {
 					missing++
 				}
 			}
@@ -522,14 +611,14 @@ func (s *MongoStoreSuite) TestAddNLargeBatch() {
 	}
 
 	start := time.Now()
-	st.AddN(quads)
+	s.Require().NoError(st.AddN(context.Background(), quads))
 	s.T().Logf("AddN of %d quads took %s", n, time.Since(start))
 
-	s.Equal(n, st.Len(nil))
+	s.Equal(n, mustV(st.Len(context.Background(), nil)))
 
 	s.Run("re-adding the same batch changes nothing", func() {
-		st.AddN(quads)
-		s.Equal(n, st.Len(nil), "the unique index makes AddN idempotent")
+		s.Require().NoError(st.AddN(context.Background(), quads))
+		s.Equal(n, mustV(st.Len(context.Background(), nil)), "the unique index makes AddN idempotent")
 	})
 }
 
@@ -552,8 +641,8 @@ func (s *MongoStoreSuite) TestPluginRegistration() {
 			_ = st.(*mongostore.MongoStore).Close()
 		}()
 
-		st.Add(triple(uri("a"), uri("p"), uri("b")), nil)
-		s.Equal(1, st.Len(nil))
+		s.Require().NoError(st.Add(context.Background(), triple(uri("a"), uri("p"), uri("b")), nil))
+		s.Equal(1, mustV(st.Len(context.Background(), nil)))
 	})
 
 	s.Run("the factory refuses to build a store it cannot connect", func() {

@@ -21,6 +21,7 @@ go get github.com/tggo/rdflibgo-mongostore
 
 ```go
 import (
+    "context"
     "github.com/tggo/goRDFlib/graph"
     "github.com/tggo/goRDFlib/sparql"
     mongostore "github.com/tggo/rdflibgo-mongostore"
@@ -36,9 +37,12 @@ if err != nil {
 defer s.Close()
 
 g := graph.NewGraph(graph.WithStore(s))
-g.Add(alice, knows, bob)
+ctx := context.Background()
+if err := g.Add(ctx, alice, knows, bob); err != nil {
+    log.Fatal(err)
+}
 
-res, err := sparql.Query(g, `PREFIX ex: <http://example.org/>
+res, err := sparql.QueryContext(ctx, g, `PREFIX ex: <http://example.org/>
     SELECT ?x WHERE { ex:alice ex:knows+ ?x }`)
 ```
 
@@ -49,24 +53,28 @@ res, err := sparql.Query(g, `PREFIX ex: <http://example.org/>
 | `WithURI(uri)` | connection string; required unless `WithClient` is used |
 | `WithDatabase(name)` | database name, default `"rdf"` |
 | `WithClient(client)` | use an already-connected driver client; `Close` leaves it alone |
-| `WithContext(ctx)` | base context for every operation |
-| `WithTimeout(d)` | per-operation deadline, default 30s |
-| `WithErrorHandler(fn)` | see below |
+| `WithTimeout(d)` | per-operation deadline on top of the caller's context, default 30s |
 
-### Errors
+### Context and errors
 
-`store.Store` has no way to return a write error — the interface predates that
-concern and every backend in goRDFlib inherits it. This one therefore reports
-what it cannot return:
+Every method takes a `context.Context` first and returns an `error` (goRDFlib
+v0.9, issue #52). The context goes to the driver, so cancelling it stops the
+command; a done context is refused before anything is sent. A driver failure is
+returned wrapped (`mongostore: Add: ...`) and `errors.Is`/`errors.As` reach the
+driver error, so a dead server is never mistaken for an empty graph. Iterators
+yield one `(zero, err)` pair and stop:
 
 ```go
-mongostore.WithErrorHandler(func(op string, err error) {
-    metrics.StoreErrors.WithLabelValues(op).Inc()
-})
+for t, err := range s.Triples(ctx, term.TriplePattern{}, nil) {
+    if err != nil {
+        return err
+    }
+    use(t)
+}
 ```
 
-The default logs through the standard `log` package. Without a handler a
-connection failure looks exactly like an empty graph, so it is worth wiring up.
+`WithContext` and `WithErrorHandler`, which existed because `store.Store` had
+no error path, were removed.
 
 ### Plugin registration
 
@@ -105,8 +113,7 @@ matches by containment.
 
 The cost of the layout is MongoDB's 16 MiB document limit: it caps how many
 objects one subject and predicate may have in a single graph, on the order of a
-hundred thousand. Exceeding it is a write error reported through the error
-handler, not silent loss.
+hundred thousand. Exceeding it is the error of that write, not silent loss.
 
 Namespace bindings live in a second collection keyed by prefix.
 
@@ -229,8 +236,8 @@ should stay that way: a failure there belongs in this store, not in a
 
 ## Compatibility
 
-Requires goRDFlib **v0.2.0 or later**, which is where `store/storetest` and
-`store.ReachabilityStore` were introduced.
+Requires goRDFlib **v0.9.0 or later**: the context and error signatures of
+`store.Store` (issue #52) and `store/storetest` with its `DoneContext` section.
 
 ## License
 

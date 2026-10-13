@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -27,16 +26,16 @@ const (
 const defaultGraphKey = ""
 
 // MongoStore implements store.Store on top of MongoDB.
-// Safe for concurrent use.
+// Safe for concurrent use. Every method takes the caller's context, passes it
+// to the driver, and returns driver failures wrapped; a done context is
+// refused before anything is sent.
 type MongoStore struct {
 	client *mongo.Client
 	db     *mongo.Database
 	tripl  *mongo.Collection
 	ns     *mongo.Collection
 
-	ctx     context.Context
 	timeout time.Duration
-	onError func(op string, err error)
 
 	// ownsClient records whether New dialed the client, and so whether Close
 	// should disconnect it. A client passed in with WithClient belongs to the
@@ -55,9 +54,7 @@ type config struct {
 	uri      string
 	database string
 	client   *mongo.Client
-	ctx      context.Context
 	timeout  time.Duration
-	onError  func(op string, err error)
 }
 
 // WithURI sets the MongoDB connection string. Required unless WithClient is
@@ -77,31 +74,12 @@ func WithClient(client *mongo.Client) Option {
 	return func(c *config) { c.client = client }
 }
 
-// WithContext sets the base context for every operation.
-//
-// store.Store predates context and none of its methods take one, so the context
-// has to be supplied here. Cancelling it makes subsequent operations fail:
-// reads return nothing and writes report through the error handler.
-func WithContext(ctx context.Context) Option {
-	return func(c *config) { c.ctx = ctx }
-}
-
-// WithTimeout bounds each individual operation. Defaults to 30s. A
+// WithTimeout bounds each individual operation, on top of whatever deadline the
+// caller's context carries, and the connection check in New. Defaults to 30s. A
 // non-positive value disables the per-operation deadline and leaves only the
-// base context.
+// caller's context.
 func WithTimeout(d time.Duration) Option {
 	return func(c *config) { c.timeout = d }
-}
-
-// WithErrorHandler installs a callback for errors that store.Store cannot
-// return — every write, and any read that fails mid-iteration. op names the
-// operation ("Add", "AddN", "Triples", …).
-//
-// The default logs through the standard log package. A test suite will usually
-// want to fail on any call; a production caller will usually want to count
-// them.
-func WithErrorHandler(h func(op string, err error)) Option {
-	return func(c *config) { c.onError = h }
 }
 
 // New connects to MongoDB and ensures the collections and indexes exist.
@@ -112,27 +90,16 @@ func WithErrorHandler(h func(op string, err error)) Option {
 func New(opts ...Option) (*MongoStore, error) {
 	cfg := config{
 		database: "rdf",
-		ctx:      context.Background(),
 		timeout:  30 * time.Second,
-		onError: func(op string, err error) {
-			log.Printf("mongostore: %s: %v", op, err)
-		},
 	}
 	for _, o := range opts {
 		o(&cfg)
-	}
-	if cfg.ctx == nil {
-		cfg.ctx = context.Background()
 	}
 	if cfg.database == "" {
 		return nil, errors.New("mongostore: database name is empty")
 	}
 
-	s := &MongoStore{
-		ctx:     cfg.ctx,
-		timeout: cfg.timeout,
-		onError: cfg.onError,
-	}
+	s := &MongoStore{timeout: cfg.timeout}
 
 	switch {
 	case cfg.client != nil:
@@ -152,12 +119,11 @@ func New(opts ...Option) (*MongoStore, error) {
 	s.tripl = s.db.Collection(triplesCollection)
 	s.ns = s.db.Collection(namespacesCollection)
 
-	ctx, cancel := s.opCtx()
+	ctx, cancel := s.opCtx(context.Background())
 	defer cancel()
 
 	// Dialing is lazy, so nothing has touched the server yet. Ping here rather
-	// than letting the first silent write be where an unreachable server shows
-	// up.
+	// than letting the first write be where an unreachable server shows up.
 	if err := s.client.Ping(ctx, nil); err != nil {
 		s.closeClient()
 		return nil, fmt.Errorf("mongostore: ping: %w", err)
@@ -246,19 +212,21 @@ func (s *MongoStore) closeClient() error {
 	return s.client.Disconnect(context.Background())
 }
 
-// opCtx derives the context for one operation. The returned cancel func must
-// always be called, even when no timeout is configured.
-func (s *MongoStore) opCtx() (context.Context, context.CancelFunc) {
+// opCtx derives the context for one operation from the caller's. The returned
+// cancel func must always be called, even when no timeout is configured.
+func (s *MongoStore) opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if s.timeout <= 0 {
-		return context.WithCancel(s.ctx)
+		return context.WithCancel(ctx)
 	}
-	return context.WithTimeout(s.ctx, s.timeout)
+	return context.WithTimeout(ctx, s.timeout)
 }
 
-func (s *MongoStore) fail(op string, err error) {
-	if err != nil && s.onError != nil {
-		s.onError(op, err)
-	}
+// wrap names the operation on a driver error so a caller can tell what failed.
+// The driver's error stays reachable through errors.Is/As, which is how a
+// caller tells a cancelled context (context.Canceled) from an unreachable
+// server (mongo.IsNetworkError, mongo.CommandError).
+func wrap(op string, err error) error {
+	return fmt.Errorf("mongostore: %s: %w", op, err)
 }
 
 // ContextAware reports true: named graphs are stored in the g field.
@@ -277,11 +245,11 @@ func (s *MongoStore) TransactionAware() bool { return s.transactional }
 // nil and store.DefaultGraph address the default graph (goRDFlib v0.5.3 gives
 // unnamed graphs that identifier). Any other term, a blank node included,
 // names a graph: TriG allows `_:g { }`.
-func graphKey(ctx term.Term) string {
-	if store.IsDefaultGraph(ctx) {
+func graphKey(graph term.Term) string {
+	if store.IsDefaultGraph(graph) {
 		return defaultGraphKey
 	}
-	return term.TermKey(ctx)
+	return term.TermKey(graph)
 }
 
 // subjectPredicateKey is the filter that identifies one stored document: the
@@ -297,24 +265,35 @@ func subjectPredicateKey(subj term.Subject, pred term.URIRef, gk string) bson.D 
 // --- writes ----------------------------------------------------------------
 
 // Add inserts a triple. Adding the same triple twice is a no-op.
-func (s *MongoStore) Add(t term.Triple, ctx term.Term) {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Add(ctx context.Context, t term.Triple, graph term.Term) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	_, err := s.tripl.UpdateOne(c,
-		subjectPredicateKey(t.Subject, t.Predicate, graphKey(ctx)),
+		subjectPredicateKey(t.Subject, t.Predicate, graphKey(graph)),
 		bson.D{{Key: "$addToSet", Value: bson.D{{Key: "o", Value: term.TermKey(t.Object)}}}},
 		options.UpdateOne().SetUpsert(true))
-	s.fail("Add", err)
+	if err != nil {
+		return wrap("Add", err)
+	}
+	return nil
 }
 
 // AddN batch-inserts quads. Duplicates, within the batch or against what is
-// already stored, are ignored.
-func (s *MongoStore) AddN(quads []term.Quad) {
-	if len(quads) == 0 {
-		return
+// already stored, are ignored. Without transactions a failure part-way leaves
+// the chunks already written in place; the retry is safe because the writes are
+// idempotent.
+func (s *MongoStore) AddN(ctx context.Context, quads []term.Quad) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	c, cancel := s.opCtx()
+	if len(quads) == 0 {
+		return nil
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	// Quads that share a subject, predicate and graph land in the same
@@ -354,13 +333,16 @@ func (s *MongoStore) AddN(quads []term.Quad) {
 	// chunk changes nothing.
 	const chunk = 1000
 	models := make([]mongo.WriteModel, 0, min(chunk, len(order)))
-	flush := func() {
+	flush := func() error {
 		if len(models) == 0 {
-			return
+			return nil
 		}
 		_, err := s.tripl.BulkWrite(c, models, options.BulkWrite().SetOrdered(false))
-		s.fail("AddN", err)
 		models = models[:0]
+		if err != nil {
+			return wrap("AddN", err)
+		}
+		return nil
 	}
 
 	for _, id := range order {
@@ -372,18 +354,23 @@ func (s *MongoStore) AddN(quads []term.Quad) {
 			}}}).
 			SetUpsert(true))
 		if len(models) == chunk {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
-	flush()
+	return flush()
 }
 
-// Remove deletes every triple matching the pattern from the given context.
-func (s *MongoStore) Remove(pattern term.TriplePattern, ctx term.Term) {
-	c, cancel := s.opCtx()
+// Remove deletes every triple matching the pattern from the given graph.
+func (s *MongoStore) Remove(ctx context.Context, pattern term.TriplePattern, graph term.Term) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
-	gk := graphKey(ctx)
+	gk := graphKey(graph)
 	filter := bson.D{{Key: "g", Value: gk}}
 	if pattern.Subject != nil {
 		filter = append(filter, bson.E{Key: "s", Value: term.TermKey(pattern.Subject)})
@@ -395,9 +382,10 @@ func (s *MongoStore) Remove(pattern term.TriplePattern, ctx term.Term) {
 	// With the object unbound, every matching document loses all its triples,
 	// so the documents themselves go.
 	if pattern.Object == nil {
-		_, err := s.tripl.DeleteMany(c, filter)
-		s.fail("Remove", err)
-		return
+		if _, err := s.tripl.DeleteMany(c, filter); err != nil {
+			return wrap("Remove", err)
+		}
+		return nil
 	}
 
 	// With the object bound, only that element leaves each document. Documents
@@ -407,17 +395,19 @@ func (s *MongoStore) Remove(pattern term.TriplePattern, ctx term.Term) {
 	pullFrom := append(filter, bson.E{Key: "o", Value: objKey})
 	if _, err := s.tripl.UpdateMany(c, pullFrom,
 		bson.D{{Key: "$pull", Value: bson.D{{Key: "o", Value: objKey}}}}); err != nil {
-		s.fail("Remove", err)
-		return
+		return wrap("Remove", err)
 	}
 	_, err := s.tripl.DeleteMany(c, bson.D{
 		{Key: "g", Value: gk},
 		{Key: "o", Value: bson.D{{Key: "$size", Value: 0}}},
 	})
-	s.fail("Remove", err)
+	if err != nil {
+		return wrap("Remove", err)
+	}
+	return nil
 }
 
-// Set replaces every triple matching (s, p, *) in the context with the given
+// Set replaces every triple matching (s, p, *) in the graph with the given
 // triple.
 //
 // It is a single-document update, and MongoDB makes those atomic on every
@@ -426,79 +416,101 @@ func (s *MongoStore) Remove(pattern term.TriplePattern, ctx term.Term) {
 // where the old value is gone and the new one is not yet there, and a
 // triple-per-document layout could only deliver that with a transaction, which
 // a standalone mongod cannot run.
-func (s *MongoStore) Set(t term.Triple, ctx term.Term) {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Set(ctx context.Context, t term.Triple, graph term.Term) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	_, err := s.tripl.UpdateOne(c,
-		subjectPredicateKey(t.Subject, t.Predicate, graphKey(ctx)),
+		subjectPredicateKey(t.Subject, t.Predicate, graphKey(graph)),
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "o", Value: bson.A{term.TermKey(t.Object)}},
 		}}},
 		options.UpdateOne().SetUpsert(true))
-	s.fail("Set", err)
+	if err != nil {
+		return wrap("Set", err)
+	}
+	return nil
 }
 
 // --- namespaces ------------------------------------------------------------
 
 // Bind associates a prefix with a namespace, replacing any previous binding for
 // that prefix.
-func (s *MongoStore) Bind(prefix string, namespace term.URIRef) {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Bind(ctx context.Context, prefix string, namespace term.URIRef) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	_, err := s.ns.ReplaceOne(c,
 		bson.D{{Key: "_id", Value: prefix}},
 		bson.D{{Key: "_id", Value: prefix}, {Key: "ns", Value: namespace.Value()}},
 		options.Replace().SetUpsert(true))
-	s.fail("Bind", err)
+	if err != nil {
+		return wrap("Bind", err)
+	}
+	return nil
 }
 
 // Namespace returns the namespace bound to a prefix.
-func (s *MongoStore) Namespace(prefix string) (term.URIRef, bool) {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Namespace(ctx context.Context, prefix string) (term.URIRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return term.URIRef{}, false, err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	var doc struct {
 		NS string `bson:"ns"`
 	}
 	err := s.ns.FindOne(c, bson.D{{Key: "_id", Value: prefix}}).Decode(&doc)
-	if err != nil {
-		if !errors.Is(err, mongo.ErrNoDocuments) {
-			s.fail("Namespace", err)
-		}
-		return term.URIRef{}, false
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return term.URIRef{}, false, nil
 	}
-	return term.NewURIRefUnsafe(doc.NS), true
+	if err != nil {
+		return term.URIRef{}, false, wrap("Namespace", err)
+	}
+	return term.NewURIRefUnsafe(doc.NS), true, nil
 }
 
 // Prefix returns a prefix bound to the namespace.
-func (s *MongoStore) Prefix(namespace term.URIRef) (string, bool) {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Prefix(ctx context.Context, namespace term.URIRef) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	var doc struct {
 		ID string `bson:"_id"`
 	}
 	err := s.ns.FindOne(c, bson.D{{Key: "ns", Value: namespace.Value()}}).Decode(&doc)
-	if err != nil {
-		if !errors.Is(err, mongo.ErrNoDocuments) {
-			s.fail("Prefix", err)
-		}
-		return "", false
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return "", false, nil
 	}
-	return doc.ID, true
+	if err != nil {
+		return "", false, wrap("Prefix", err)
+	}
+	return doc.ID, true, nil
 }
 
 // Namespaces iterates over every binding.
-func (s *MongoStore) Namespaces() store.NamespaceIterator {
-	return func(yield func(string, term.URIRef) bool) {
-		c, cancel := s.opCtx()
+func (s *MongoStore) Namespaces(ctx context.Context) store.NamespaceIterator {
+	return func(yield func(store.NamespaceBinding, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(store.NamespaceBinding{}, err)
+			return
+		}
+		c, cancel := s.opCtx(ctx)
 		defer cancel()
 
 		cur, err := s.ns.Find(c, bson.D{})
 		if err != nil {
-			s.fail("Namespaces", err)
+			yield(store.NamespaceBinding{}, wrap("Namespaces", err))
 			return
 		}
 		defer cur.Close(c)
@@ -509,14 +521,17 @@ func (s *MongoStore) Namespaces() store.NamespaceIterator {
 				NS string `bson:"ns"`
 			}
 			if err := cur.Decode(&doc); err != nil {
-				s.fail("Namespaces", err)
-				continue
+				yield(store.NamespaceBinding{}, wrap("Namespaces: decode", err))
+				return
 			}
-			if !yield(doc.ID, term.NewURIRefUnsafe(doc.NS)) {
+			b := store.NamespaceBinding{Prefix: doc.ID, Namespace: term.NewURIRefUnsafe(doc.NS)}
+			if !yield(b, nil) {
 				return
 			}
 		}
-		s.fail("Namespaces", cur.Err())
+		if err := cur.Err(); err != nil {
+			yield(store.NamespaceBinding{}, wrap("Namespaces", err))
+		}
 	}
 }
 

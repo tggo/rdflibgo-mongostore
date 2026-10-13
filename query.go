@@ -18,8 +18,8 @@ import (
 // one graph. A bound object matches against the object array by containment,
 // which is ordinary MongoDB array semantics and is served by the multikey pog
 // and og indexes.
-func patternFilter(pattern term.TriplePattern, ctx term.Term) bson.D {
-	filter := bson.D{{Key: "g", Value: graphKey(ctx)}}
+func patternFilter(pattern term.TriplePattern, graph term.Term) bson.D {
+	filter := bson.D{{Key: "g", Value: graphKey(graph)}}
 	if pattern.Subject != nil {
 		filter = append(filter, bson.E{Key: "s", Value: term.TermKey(pattern.Subject)})
 	}
@@ -73,13 +73,13 @@ func (e *decodeError) Error() string {
 	return "mongostore: cannot decode " + e.field + " " + e.key + ": " + e.reason
 }
 
-// Triples iterates over the triples matching the pattern in the given context.
+// Triples iterates over the triples matching the pattern in the given graph.
 //
 // The cursor is opened when iteration starts, not when Triples is called, and
 // closed when it ends — including when the consumer stops early by returning
-// false.
-func (s *MongoStore) Triples(pattern term.TriplePattern, ctx term.Term) store.TripleIterator {
-	filter := patternFilter(pattern, ctx)
+// false. A failure yields one (zero, err) pair and ends the iteration.
+func (s *MongoStore) Triples(ctx context.Context, pattern term.TriplePattern, graph term.Term) store.TripleIterator {
+	filter := patternFilter(pattern, graph)
 
 	// With the object bound, only the matching element of the array is worth
 	// transferring. A subject with a wide predicate would otherwise ship its
@@ -97,13 +97,17 @@ func (s *MongoStore) Triples(pattern term.TriplePattern, ctx term.Term) store.Tr
 	}
 	opts := options.Find().SetProjection(projection)
 
-	return func(yield func(term.Triple) bool) {
-		c, cancel := s.opCtx()
+	return func(yield func(term.Triple, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(term.Triple{}, err)
+			return
+		}
+		c, cancel := s.opCtx(ctx)
 		defer cancel()
 
 		cur, err := s.tripl.Find(c, filter, opts)
 		if err != nil {
-			s.fail("Triples", err)
+			yield(term.Triple{}, wrap("Triples", err))
 			return
 		}
 		defer cur.Close(c)
@@ -111,35 +115,37 @@ func (s *MongoStore) Triples(pattern term.TriplePattern, ctx term.Term) store.Tr
 		for cur.Next(c) {
 			var row tripleRow
 			if err := cur.Decode(&row); err != nil {
-				s.fail("Triples", err)
-				continue
+				yield(term.Triple{}, wrap("Triples: decode", err))
+				return
 			}
 			subj, pred, err := row.subjectPredicate()
 			if err != nil {
-				s.fail("Triples", err)
-				continue
+				yield(term.Triple{}, wrap("Triples", err))
+				return
 			}
 			for _, objKey := range row.O {
 				obj, err := term.TermFromKey(objKey)
 				if err != nil {
-					s.fail("Triples", err)
-					continue
+					yield(term.Triple{}, wrap("Triples", err))
+					return
 				}
-				if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}) {
+				if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}, nil) {
 					return
 				}
 			}
 		}
-		s.fail("Triples", cur.Err())
+		if err := cur.Err(); err != nil {
+			yield(term.Triple{}, wrap("Triples", err))
+		}
 	}
 }
 
 // unwindPipeline turns matching documents back into one entry per triple.
 // Anything that counts or pages over triples rather than over documents needs
 // it, because a document holds a whole object list.
-func unwindPipeline(pattern term.TriplePattern, ctx term.Term) mongo.Pipeline {
+func unwindPipeline(pattern term.TriplePattern, graph term.Term) mongo.Pipeline {
 	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$match", Value: patternFilter(pattern, ctx)}},
+		bson.D{{Key: "$match", Value: patternFilter(pattern, graph)}},
 		bson.D{{Key: "$unwind", Value: "$o"}},
 	}
 	// $unwind emits every object of each matching document, including the ones
@@ -160,8 +166,8 @@ func unwindPipeline(pattern term.TriplePattern, ctx term.Term) mongo.Pipeline {
 // negative offset is treated as zero. Store promises no iteration order, and
 // this backend does not impose one either, so paging across separate calls is
 // only meaningful together with a caller-side sort.
-func (s *MongoStore) TriplesWithLimit(pattern term.TriplePattern, ctx term.Term, limit, offset int) store.TripleIterator {
-	pipeline := unwindPipeline(pattern, ctx)
+func (s *MongoStore) TriplesWithLimit(ctx context.Context, pattern term.TriplePattern, graph term.Term, limit, offset int) store.TripleIterator {
+	pipeline := unwindPipeline(pattern, graph)
 	if offset > 0 {
 		pipeline = append(pipeline, bson.D{{Key: "$skip", Value: int64(offset)}})
 	}
@@ -169,13 +175,17 @@ func (s *MongoStore) TriplesWithLimit(pattern term.TriplePattern, ctx term.Term,
 		pipeline = append(pipeline, bson.D{{Key: "$limit", Value: int64(limit)}})
 	}
 
-	return func(yield func(term.Triple) bool) {
-		c, cancel := s.opCtx()
+	return func(yield func(term.Triple, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(term.Triple{}, err)
+			return
+		}
+		c, cancel := s.opCtx(ctx)
 		defer cancel()
 
 		cur, err := s.tripl.Aggregate(c, pipeline)
 		if err != nil {
-			s.fail("TriplesWithLimit", err)
+			yield(term.Triple{}, wrap("TriplesWithLimit", err))
 			return
 		}
 		defer cur.Close(c)
@@ -189,31 +199,33 @@ func (s *MongoStore) TriplesWithLimit(pattern term.TriplePattern, ctx term.Term,
 				O string `bson:"o"`
 			}
 			if err := cur.Decode(&row); err != nil {
-				s.fail("TriplesWithLimit", err)
-				continue
+				yield(term.Triple{}, wrap("TriplesWithLimit: decode", err))
+				return
 			}
 			subj, pred, err := tripleRow{S: row.S, P: row.P}.subjectPredicate()
 			if err != nil {
-				s.fail("TriplesWithLimit", err)
-				continue
+				yield(term.Triple{}, wrap("TriplesWithLimit", err))
+				return
 			}
 			obj, err := term.TermFromKey(row.O)
 			if err != nil {
-				s.fail("TriplesWithLimit", err)
-				continue
+				yield(term.Triple{}, wrap("TriplesWithLimit", err))
+				return
 			}
-			if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}) {
+			if !yield(term.Triple{Subject: subj, Predicate: pred, Object: obj}, nil) {
 				return
 			}
 		}
-		s.fail("TriplesWithLimit", cur.Err())
+		if err := cur.Err(); err != nil {
+			yield(term.Triple{}, wrap("TriplesWithLimit", err))
+		}
 	}
 }
 
-// Len returns the number of triples in the given context.
-// A nil or blank node context means the default graph.
-func (s *MongoStore) Len(ctx term.Term) int {
-	return s.Count(term.TriplePattern{}, ctx)
+// Len returns the number of triples in the given graph.
+// A nil context or store.DefaultGraph means the default graph.
+func (s *MongoStore) Len(ctx context.Context, graph term.Term) (int, error) {
+	return s.Count(ctx, term.TriplePattern{}, graph)
 }
 
 // Count returns the number of triples matching the pattern without
@@ -222,29 +234,30 @@ func (s *MongoStore) Len(ctx term.Term) int {
 // A bound object means at most one triple per document, so counting documents
 // answers it directly. Otherwise the object lists have to be summed, which is
 // what the aggregation does.
-func (s *MongoStore) Count(pattern term.TriplePattern, ctx term.Term) int {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Count(ctx context.Context, pattern term.TriplePattern, graph term.Term) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
 	if pattern.Object != nil {
-		n, err := s.tripl.CountDocuments(c, patternFilter(pattern, ctx))
+		n, err := s.tripl.CountDocuments(c, patternFilter(pattern, graph))
 		if err != nil {
-			s.fail("Count", err)
-			return 0
+			return 0, wrap("Count", err)
 		}
-		return int(n)
+		return int(n), nil
 	}
 
 	cur, err := s.tripl.Aggregate(c, mongo.Pipeline{
-		bson.D{{Key: "$match", Value: patternFilter(pattern, ctx)}},
+		bson.D{{Key: "$match", Value: patternFilter(pattern, graph)}},
 		bson.D{{Key: "$group", Value: bson.D{
 			{Key: "_id", Value: nil},
 			{Key: "n", Value: bson.D{{Key: "$sum", Value: bson.D{{Key: "$size", Value: "$o"}}}}},
 		}}},
 	})
 	if err != nil {
-		s.fail("Count", err)
-		return 0
+		return 0, wrap("Count", err)
 	}
 	defer cur.Close(c)
 
@@ -254,46 +267,50 @@ func (s *MongoStore) Count(pattern term.TriplePattern, ctx term.Term) int {
 			N int `bson:"n"`
 		}
 		if err := cur.Decode(&row); err != nil {
-			s.fail("Count", err)
-			return 0
+			return 0, wrap("Count: decode", err)
 		}
 		total += row.N
 	}
 	if err := cur.Err(); err != nil {
-		s.fail("Count", err)
-		return 0
+		return 0, wrap("Count", err)
 	}
-	return total
+	return total, nil
 }
 
 // Exists reports whether at least one triple matches the pattern. It asks the
 // server for one document rather than counting them all.
-func (s *MongoStore) Exists(pattern term.TriplePattern, ctx term.Term) bool {
-	c, cancel := s.opCtx()
+func (s *MongoStore) Exists(ctx context.Context, pattern term.TriplePattern, graph term.Term) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	c, cancel := s.opCtx(ctx)
 	defer cancel()
 
-	err := s.tripl.FindOne(c, patternFilter(pattern, ctx),
+	err := s.tripl.FindOne(c, patternFilter(pattern, graph),
 		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).
 		Err()
 	switch {
 	case err == nil:
-		return true
+		return true, nil
 	case errors.Is(err, mongo.ErrNoDocuments):
-		return false
+		return false, nil
 	default:
-		s.fail("Exists", err)
-		return false
+		return false, wrap("Exists", err)
 	}
 }
 
 // Contexts iterates over the named graphs, optionally restricted to those
 // holding a particular triple.
 //
-// The default graph is not a context and is never reported, which is why the
+// The default graph is not a graph name and is never reported, which is why the
 // filter excludes the empty graph key.
-func (s *MongoStore) Contexts(triple *term.Triple) store.TermIterator {
-	return func(yield func(term.Term) bool) {
-		c, cancel := s.opCtx()
+func (s *MongoStore) Contexts(ctx context.Context, triple *term.Triple) store.TermIterator {
+	return func(yield func(term.Term, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
+		c, cancel := s.opCtx(ctx)
 		defer cancel()
 
 		filter := bson.D{{Key: "g", Value: bson.D{{Key: "$ne", Value: defaultGraphKey}}}}
@@ -313,7 +330,7 @@ func (s *MongoStore) Contexts(triple *term.Triple) store.TermIterator {
 			bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$g"}}}},
 		})
 		if err != nil {
-			s.fail("Contexts", err)
+			yield(nil, wrap("Contexts", err))
 			return
 		}
 		defer cur.Close(c)
@@ -323,19 +340,21 @@ func (s *MongoStore) Contexts(triple *term.Triple) store.TermIterator {
 				ID string `bson:"_id"`
 			}
 			if err := cur.Decode(&row); err != nil {
-				s.fail("Contexts", err)
-				continue
+				yield(nil, wrap("Contexts: decode", err))
+				return
 			}
 			g, err := term.TermFromKey(row.ID)
 			if err != nil {
-				s.fail("Contexts", err)
-				continue
+				yield(nil, wrap("Contexts", err))
+				return
 			}
-			if !yield(g) {
+			if !yield(g, nil) {
 				return
 			}
 		}
-		s.fail("Contexts", cur.Err())
+		if err := cur.Err(); err != nil {
+			yield(nil, wrap("Contexts", err))
+		}
 	}
 }
 

@@ -159,12 +159,6 @@ func (s *MongoStoreSuite) newStoreInDB(t *testing.T, db string, opts ...mongosto
 		mongostore.WithURI(s.uri),
 		mongostore.WithDatabase(db),
 		mongostore.WithTimeout(opTimeout),
-		// Any error store.Store cannot return is a test failure. Left at the
-		// default it would go to the log and the test would pass with a store
-		// that quietly dropped every write.
-		mongostore.WithErrorHandler(func(op string, err error) {
-			t.Errorf("mongostore reported an error from %s: %v", op, err)
-		}),
 	}, opts...)
 
 	st, err := mongostore.New(all...)
@@ -198,11 +192,14 @@ func keys(terms []term.Term) []string {
 	return out
 }
 
-func countTriples(it store.TripleIterator) int {
+func countTriples(t *testing.T, it store.TripleIterator) int {
+	t.Helper()
 	n := 0
-	it(func(term.Triple) bool {
+	for _, err := range it {
+		if err != nil {
+			t.Fatalf("Triples: %v", err)
+		}
 		n++
-		return true
-	})
+	}
 	return n
 }

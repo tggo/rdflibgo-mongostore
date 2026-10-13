@@ -37,7 +37,7 @@
 // The cost of the layout is MongoDB's 16 MiB document limit: it caps how many
 // objects a single subject and predicate may have in one graph. Reaching that
 // takes on the order of a hundred thousand objects on one (s, p) pair, and it
-// surfaces as a write error through the handler rather than as silent loss.
+// surfaces as the error of the write rather than as silent loss.
 //
 // Namespace bindings live in a second collection keyed by prefix.
 //
@@ -55,10 +55,15 @@
 // MongoStore is safe for concurrent use. It holds no mutable state of its own;
 // the driver's Client is itself safe for concurrent use and pools connections.
 //
-// # Error handling
+// # Context and errors
 //
-// store.Store has no way to report a write error, so write failures are passed
-// to the handler installed with WithErrorHandler, which defaults to logging
-// through the standard log package. Set it to something that fails loudly in
-// tests, or to a no-op to silence it.
+// Every method takes the caller's context first, passes it to the driver, and
+// returns driver failures wrapped with the operation name ("mongostore: Add:
+// ..."). errors.Is and errors.As reach the driver's error. A done context is
+// refused before anything is sent. Iterators yield one (zero, err) pair on
+// failure and stop. WithTimeout adds a per-operation deadline on top of the
+// caller's.
+//
+// Only New has no context parameter: it checks the connection under the
+// WithTimeout deadline.
 package mongostore
