@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/stretchr/testify v1.12.1
-	github.com/tggo/goRDFlib v0.8.1-0.20261013090930-1bbfeaf946a2
+	github.com/tggo/goRDFlib v0.9.0
 	go.mongodb.org/mongo-driver/v2 v2.8.1
 )
 
