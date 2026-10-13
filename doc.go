@@ -41,6 +41,9 @@
 //
 // Namespace bindings live in a second collection keyed by prefix.
 //
+// The collections are called "triples" and "namespaces". WithCollectionPrefix
+// prepends a prefix to both, so several stores can share one database.
+//
 // # Why MongoDB
 //
 // The reason to reach for this backend rather than a generic document store is

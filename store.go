@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -14,8 +15,7 @@ import (
 	"github.com/tggo/goRDFlib/term"
 )
 
-// Collection names. They are fixed rather than configurable: two stores sharing
-// a database would otherwise silently disagree about where the data is.
+// Collection names, before WithCollectionPrefix.
 const (
 	triplesCollection    = "triples"
 	namespacesCollection = "namespaces"
@@ -55,6 +55,7 @@ type config struct {
 	database string
 	client   *mongo.Client
 	timeout  time.Duration
+	prefix   string
 }
 
 // WithURI sets the MongoDB connection string. Required unless WithClient is
@@ -72,6 +73,18 @@ func WithDatabase(name string) Option {
 // The client is not closed by Close; it stays the caller's to manage.
 func WithClient(client *mongo.Client) Option {
 	return func(c *config) { c.client = client }
+}
+
+// WithCollectionPrefix puts the store's collections at "<prefix>triples" and
+// "<prefix>namespaces", so several stores can share one database, or one that
+// already has collections of those names. Stores with different prefixes do
+// not see each other's data; every store opening the same data must use the
+// same prefix. Defaults to "" (collections "triples" and "namespaces").
+//
+// A prefix with '$' or NUL, or one starting with "system.", is refused by New:
+// MongoDB does not allow such collection names.
+func WithCollectionPrefix(prefix string) Option {
+	return func(c *config) { c.prefix = prefix }
 }
 
 // WithTimeout bounds each individual operation, on top of whatever deadline the
@@ -98,6 +111,9 @@ func New(opts ...Option) (*MongoStore, error) {
 	if cfg.database == "" {
 		return nil, errors.New("mongostore: database name is empty")
 	}
+	if strings.ContainsAny(cfg.prefix, "$\x00") || strings.HasPrefix(cfg.prefix, "system.") {
+		return nil, fmt.Errorf("mongostore: collection prefix %q is not usable in a MongoDB collection name (no '$', no NUL, not \"system.\")", cfg.prefix)
+	}
 
 	s := &MongoStore{timeout: cfg.timeout}
 
@@ -116,8 +132,8 @@ func New(opts ...Option) (*MongoStore, error) {
 	}
 
 	s.db = s.client.Database(cfg.database)
-	s.tripl = s.db.Collection(triplesCollection)
-	s.ns = s.db.Collection(namespacesCollection)
+	s.tripl = s.db.Collection(cfg.prefix + triplesCollection)
+	s.ns = s.db.Collection(cfg.prefix + namespacesCollection)
 
 	ctx, cancel := s.opCtx(context.Background())
 	defer cancel()

@@ -52,6 +52,7 @@ res, err := sparql.QueryContext(ctx, g, `PREFIX ex: <http://example.org/>
 |---|---|
 | `WithURI(uri)` | connection string; required unless `WithClient` is used |
 | `WithDatabase(name)` | database name, default `"rdf"` |
+| `WithCollectionPrefix(p)` | collections `<p>triples` and `<p>namespaces`, so several stores can share one database; default `""` |
 | `WithClient(client)` | use an already-connected driver client; `Close` leaves it alone |
 | `WithTimeout(d)` | per-operation deadline on top of the caller's context, default 30s |
 
@@ -75,6 +76,9 @@ for t, err := range s.Triples(ctx, term.TriplePattern{}, nil) {
 
 `WithContext` and `WithErrorHandler`, which existed because `store.Store` had
 no error path, were removed.
+
+In a shared database, `DropCollections(ctx)` removes the store's two
+collections and nothing else; `DropDatabase` removes the whole database.
 
 ### Plugin registration
 
@@ -191,6 +195,11 @@ Because the objects live in an array, the forward direction flattens
 Measured on a laptop against a standalone `mongo:8` in Docker: the closure over
 a 2000-edge chain takes ~180 ms, one round trip.
 
+**One aggregation per distinct start node.** A sequence such as
+`rdf:type/rdfs:subClassOf*` reaches the repetition once per typed node, but
+goRDFlib (v0.9.1) caches `Reachable` answers for the duration of a query, so
+340 items in 20 classes cost 20 aggregations, not 340.
+
 ## Atomicity on a standalone mongod
 
 `store.Store` requires `Set` to replace `(s, p, *)` such that a concurrent
@@ -236,7 +245,7 @@ should stay that way: a failure there belongs in this store, not in a
 
 ## Compatibility
 
-Requires goRDFlib **v0.9.0 or later**: the context and error signatures of
+Requires goRDFlib **v0.9.0 or later** (v0.9.1 for one aggregation per distinct start node): the context and error signatures of
 `store.Store` (issue #52) and `store/storetest` with its `DoneContext` section.
 
 ## License

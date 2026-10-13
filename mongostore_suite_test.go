@@ -76,7 +76,9 @@ func (s *MongoStoreSuite) SetupSuite() {
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: mongoImage,
 		Tag:        mongoTag,
-		Cmd:        []string{"--bind_ip_all"},
+		// enableTestCommands lets a test make a command slow on the server
+		// (the failCommand fail point), which is how cancellation is tested.
+		Cmd: []string{"--bind_ip_all", "--setParameter", "enableTestCommands=1"},
 	}, func(cfg *dc.HostConfig) {
 		cfg.AutoRemove = true
 		cfg.RestartPolicy = dc.RestartPolicy{Name: "no"}

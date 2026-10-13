@@ -370,11 +370,25 @@ func (s *MongoStore) Collection() *mongo.Collection { return s.tripl }
 // terms as Collection.
 func (s *MongoStore) NamespaceCollection() *mongo.Collection { return s.ns }
 
-// DropDatabase removes the store's entire database, indexes included. It is not
-// part of store.Store; it exists so that a test or a tear-down can reclaim
-// everything in one call.
+// DropDatabase removes the store's entire database, indexes included, and with
+// it every other collection in that database. It is not part of store.Store; it
+// exists so that a test or a tear-down can reclaim everything in one call. In a
+// shared database (WithCollectionPrefix) use DropCollections.
 func (s *MongoStore) DropDatabase(ctx context.Context) error {
 	return s.db.Drop(ctx)
+}
+
+// DropCollections removes the store's two collections, indexes included, and
+// nothing else in the database. A store opened on them again recreates the
+// indexes in New.
+func (s *MongoStore) DropCollections(ctx context.Context) error {
+	if err := s.tripl.Drop(ctx); err != nil {
+		return wrap("DropCollections", err)
+	}
+	if err := s.ns.Drop(ctx); err != nil {
+		return wrap("DropCollections", err)
+	}
+	return nil
 }
 
 // Drop removes every triple and every namespace binding, leaving the indexes in

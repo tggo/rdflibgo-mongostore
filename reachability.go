@@ -91,7 +91,7 @@ func (s *MongoStore) Reachable(ctx context.Context, q store.ReachabilityQuery) (
 		restrict = append(restrict, predMatch...)
 
 		lookup := bson.D{
-			{Key: "from", Value: triplesCollection},
+			{Key: "from", Value: s.tripl.Name()},
 			{Key: "startWith", Value: "$seeds"},
 			{Key: "connectFromField", Value: fromField},
 			{Key: "connectToField", Value: toField},
