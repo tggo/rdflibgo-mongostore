@@ -4,6 +4,7 @@ package mongostore_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -26,7 +27,8 @@ import (
 
 const (
 	mongoImage    = "mongo"
-	mongoTag      = "8"
+	mongoTag      = "8" // MONGO_TAG overrides it; see .github/workflows/ci.yml
+	envTag        = "MONGO_TAG"
 	startTimeout  = 90 * time.Second
 	containerTTL  = 600 // seconds; a safety net if the suite is killed
 	opTimeout     = 20 * time.Second
@@ -77,7 +79,7 @@ func (s *MongoStoreSuite) SetupSuite() {
 
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: mongoImage,
-		Tag:        mongoTag,
+		Tag:        cmp.Or(os.Getenv(envTag), mongoTag),
 		// enableTestCommands lets a test make a command slow on the server
 		// (the failCommand fail point), which is how cancellation is tested.
 		Cmd: []string{"--bind_ip_all", "--setParameter", "enableTestCommands=1"},
