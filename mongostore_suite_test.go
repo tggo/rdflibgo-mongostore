@@ -87,7 +87,10 @@ func (s *MongoStoreSuite) SetupSuite() {
 	s.resource = resource
 	s.Require().NoError(resource.Expire(containerTTL), "set container ttl")
 
-	s.uri = fmt.Sprintf("mongodb://localhost:%s/", resource.GetPort("27017/tcp"))
+	// 127.0.0.1, not localhost: Docker publishes the port on IPv4, and a
+	// resolver that tries ::1 first (Go 1.27 on GitHub's runners) gets
+	// "connection refused" for the whole start timeout.
+	s.uri = fmt.Sprintf("mongodb://127.0.0.1:%s/", resource.GetPort("27017/tcp"))
 
 	s.waitReady()
 }
