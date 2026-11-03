@@ -3,9 +3,11 @@
 package mongostore_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,7 +82,8 @@ func (s *MongoStoreSuite) SetupSuite() {
 		// (the failCommand fail point), which is how cancellation is tested.
 		Cmd: []string{"--bind_ip_all", "--setParameter", "enableTestCommands=1"},
 	}, func(cfg *dc.HostConfig) {
-		cfg.AutoRemove = true
+		// Not AutoRemove: a mongod that dies on start must leave its logs for
+		// containerReport. TearDownSuite purges it; Expire is the safety net.
 		cfg.RestartPolicy = dc.RestartPolicy{Name: "no"}
 	})
 	s.Require().NoError(err, "start mongo container")
@@ -132,7 +135,35 @@ func (s *MongoStoreSuite) waitReady() {
 		}
 		return client.Database(databasePrefx + "ready").Drop(ctx)
 	})
-	s.Require().NoError(err, "wait for a writable mongod")
+	s.Require().NoError(err, "wait for a writable mongod%s", s.containerReport())
+}
+
+// containerReport describes the container after a failed start: its state and
+// the end of its log. Without it a mongod that exits on start reads only as
+// "connection refused" for the whole start timeout.
+func (s *MongoStoreSuite) containerReport() string {
+	if s.resource == nil {
+		return ""
+	}
+	id := s.resource.Container.ID
+	var b strings.Builder
+	if c, err := s.pool.Client.InspectContainer(id); err == nil {
+		fmt.Fprintf(&b, "\ncontainer %s: status=%s exit=%d oom=%v error=%q",
+			s.resource.Container.Name, c.State.Status, c.State.ExitCode, c.State.OOMKilled, c.State.Error)
+	} else {
+		fmt.Fprintf(&b, "\ncontainer %s: inspect failed: %v", s.resource.Container.Name, err)
+	}
+	var logs bytes.Buffer
+	if err := s.pool.Client.Logs(dc.LogsOptions{
+		Container: id, OutputStream: &logs, ErrorStream: &logs,
+		Stdout: true, Stderr: true, Tail: "40",
+	}); err != nil {
+		fmt.Fprintf(&b, "\nlogs unavailable: %v", err)
+	} else {
+		b.WriteString("\n--- last 40 lines of the mongod log ---\n")
+		b.WriteString(logs.String())
+	}
+	return b.String()
 }
 
 func (s *MongoStoreSuite) TearDownSuite() {
