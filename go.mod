@@ -1,11 +1,11 @@
 module github.com/tggo/rdflibgo-mongostore
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/stretchr/testify v1.12.1
-	github.com/tggo/goRDFlib v0.9.1
+	github.com/tggo/goRDFlib v0.10.0
 	go.mongodb.org/mongo-driver/v2 v2.8.1
 )
 
@@ -24,7 +24,7 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/sys/user v0.3.0 // indirect
 	github.com/moby/term v0.5.0 // indirect
@@ -43,7 +43,7 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
